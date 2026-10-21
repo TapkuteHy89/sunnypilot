@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT=/data/openpilot-next
-STAGE=/data/local/tmp/mi8-live-camera-calibration-20261021-v2
-BACKUP=/data/openpilot/device-backups/mi8-live-camera-calibration-20261021-v2
+STAGE=/data/local/tmp/mi8-live-camera-calibration-20261021-v3
+BACKUP=/data/openpilot/device-backups/mi8-live-camera-calibration-20261021-v3
 PYTHON=$ROOT/.venv/bin/python
 PYTEST=/usr/local/venv/bin/pytest
 LEGACY_API=/data/local/tmp/x7-driver-gas-state5-deploy-20261018-v1/legacy-api
@@ -116,6 +116,8 @@ export PYTHONPYCACHEPREFIX="$STAGE/pycache"
 "$PYTEST" -q openpilot/selfdrive/modeld/tests/test_mi8_camera.py \
   openpilot/selfdrive/locationd/test/test_calibrationd.py > "$STAGE/test-results.txt"
 "$PYTHON" "$STAGE/reset_mi8_camera_calibration.py" > "$STAGE/calibration-reset.json"
+chown comma:comma "$CALIBRATION_PARAM"
+chmod 0600 "$CALIBRATION_PARAM"
 
 sha256sum "${FILES[@]}" > "$STAGE/installed-sha256.txt"
 cp -a "$STAGE/test-results.txt" "$STAGE/calibration-reset.json" "$STAGE/installed-sha256.txt" "$BACKUP/"
