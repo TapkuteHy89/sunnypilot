@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT=/data/openpilot-next
-STAGE=/data/local/tmp/mi8-live-camera-calibration-20261021-v1
-BACKUP=/data/openpilot/device-backups/mi8-live-camera-calibration-20261021-v1
+STAGE=/data/local/tmp/mi8-live-camera-calibration-20261021-v2
+BACKUP=/data/openpilot/device-backups/mi8-live-camera-calibration-20261021-v2
 PYTHON=$ROOT/.venv/bin/python
 PYTEST=/usr/local/venv/bin/pytest
 LEGACY_API=/data/local/tmp/x7-driver-gas-state5-deploy-20261018-v1/legacy-api
@@ -23,13 +23,24 @@ service_was_active=0
 state_changed=0
 success=0
 
+install_mode() {
+  case "$1" in
+    openpilot/selfdrive/modeld/modeld.py|openpilot/sunnypilot/modeld_v2/modeld.py)
+      printf '0755\n'
+      ;;
+    *)
+      printf '0644\n'
+      ;;
+  esac
+}
+
 restore_all() {
   set +e
   sudo -n systemctl stop comma.service >/dev/null 2>&1 || true
   while IFS= read -r relative; do
     test -n "$relative" || continue
     if test -f "$BACKUP/source/$relative"; then
-      install -D -o comma -g comma -m 0644 "$BACKUP/source/$relative" "$ROOT/$relative"
+      install -D -o comma -g comma -m "$(install_mode "$relative")" "$BACKUP/source/$relative" "$ROOT/$relative"
     fi
   done < "$BACKUP/file-list.txt"
 
@@ -91,9 +102,11 @@ test ! -f "$LEGACY_EXTRINSICS" || cp -a "$LEGACY_EXTRINSICS" "$BACKUP/legacy/mi8
 
 state_changed=1
 for relative in "${FILES[@]}"; do
-  install -D -o comma -g comma -m 0644 "$STAGE/app/$relative" "$ROOT/$relative"
+  install -D -o comma -g comma -m "$(install_mode "$relative")" "$STAGE/app/$relative" "$ROOT/$relative"
   test "$(sha256sum "$ROOT/$relative" | cut -d' ' -f1)" = "$(sha256sum "$STAGE/app/$relative" | cut -d' ' -f1)"
 done
+test -x "$ROOT/openpilot/selfdrive/modeld/modeld.py"
+test -x "$ROOT/openpilot/sunnypilot/modeld_v2/modeld.py"
 rm -f -- "$LEGACY_EXTRINSICS"
 
 cd "$ROOT"
