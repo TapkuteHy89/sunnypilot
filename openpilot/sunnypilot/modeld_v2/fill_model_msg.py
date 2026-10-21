@@ -3,6 +3,7 @@ import capnp
 import numpy as np
 from openpilot.cereal import log
 from openpilot.sunnypilot.modeld_v2.constants import ModelConstants, Plan
+from openpilot.selfdrive.modeld.mi8_camera import compose_wide_camera_extrinsics
 from openpilot.sunnypilot.models.helpers import plan_x_idxs_helper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_plan
 
@@ -201,7 +202,8 @@ def fill_model_msg(base_msg: capnp._DynamicStructBuilder, extended_msg: capnp._D
     modelV2.rawPredictions = net_output_data['raw_pred'].tobytes()
 
 def fill_pose_msg(msg: capnp._DynamicStructBuilder, net_output_data: dict[str, np.ndarray],
-                  vipc_frame_id: int, vipc_dropped_frames: int, timestamp_eof: int, live_calib_seen: bool) -> None:
+                  vipc_frame_id: int, vipc_dropped_frames: int, timestamp_eof: int, live_calib_seen: bool,
+                  wide_camera_from_device_euler: np.ndarray | None = None) -> None:
   msg.valid = live_calib_seen & (vipc_dropped_frames < 1)
   cameraOdometry = msg.cameraOdometry
 
@@ -210,7 +212,9 @@ def fill_pose_msg(msg: capnp._DynamicStructBuilder, net_output_data: dict[str, n
 
   cameraOdometry.trans = net_output_data['pose'][0,:3].tolist()
   cameraOdometry.rot = net_output_data['pose'][0,3:].tolist()
-  cameraOdometry.wideFromDeviceEuler = net_output_data['wide_from_device_euler'][0,:].tolist()
+  cameraOdometry.wideFromDeviceEuler = compose_wide_camera_extrinsics(
+    wide_camera_from_device_euler, net_output_data['wide_from_device_euler'][0, :],
+  ).tolist()
   cameraOdometry.roadTransformTrans = net_output_data['road_transform'][0,:3].tolist()
   cameraOdometry.transStd = net_output_data['pose_stds'][0,:3].tolist()
   cameraOdometry.rotStd = net_output_data['pose_stds'][0,3:].tolist()

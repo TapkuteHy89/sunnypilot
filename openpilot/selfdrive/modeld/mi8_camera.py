@@ -1,13 +1,12 @@
-from pathlib import Path
 import os
 
 import numpy as np
 
 from openpilot.cereal.visionipc import VisionStreamType
-from openpilot.common.swaglog import cloudlog
+from openpilot.common.transformations.orientation import euler_from_rot, rot_from_euler
 
 
-MI8_WIDE_CAMERA_EXTRINSICS_PATH = Path("/data/mi8_wide_from_device_euler.txt")
+MAX_WIDE_CAMERA_ANGLE = np.radians(5.0)
 
 
 def is_mi8_hardware() -> bool:
@@ -32,15 +31,16 @@ def select_road_streams(available_streams, mi8_hardware: bool | None = None):
   return main_stream, use_extra_client, main_wide_camera, mi8_dual_camera
 
 
-def load_mi8_wide_camera_extrinsics(path: Path = MI8_WIDE_CAMERA_EXTRINSICS_PATH) -> np.ndarray | None:
-  if not path.is_file():
-    return None
-  try:
-    values = np.fromstring(path.read_text().strip(), dtype=np.float32, sep=" ")
-  except OSError:
-    cloudlog.exception("failed to read Mi 8 wide-camera extrinsics")
-    return None
-  if values.shape != (3,) or not np.isfinite(values).all() or np.any(np.abs(values) > np.radians(5.0)):
-    cloudlog.error(f"ignoring invalid Mi 8 wide-camera extrinsics: {values}")
+def get_live_wide_camera_extrinsics(extrinsics_calibration) -> np.ndarray | None:
+  values = np.asarray(extrinsics_calibration.wideFromDeviceEuler, dtype=np.float32)
+  if values.shape != (3,) or not np.isfinite(values).all() or np.any(np.abs(values) > MAX_WIDE_CAMERA_ANGLE):
     return None
   return values
+
+
+def compose_wide_camera_extrinsics(current: np.ndarray | None, residual: np.ndarray) -> np.ndarray:
+  """Convert the model residual into the absolute wide-from-device rotation."""
+  residual = np.asarray(residual, dtype=np.float32)
+  if current is None:
+    return residual
+  return euler_from_rot(rot_from_euler(current) @ rot_from_euler(residual)).astype(np.float32)

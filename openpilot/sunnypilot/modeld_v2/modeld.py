@@ -19,7 +19,7 @@ from setproctitle import setproctitle
 import openpilot.cereal.messaging as messaging
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.selfdrive.modeld.helpers import chestnut_present, wait_for_chestnut
-from openpilot.selfdrive.modeld.mi8_camera import select_road_streams, load_mi8_wide_camera_extrinsics
+from openpilot.selfdrive.modeld.mi8_camera import select_road_streams, get_live_wide_camera_extrinsics
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.services import SERVICE_LIST
@@ -350,13 +350,9 @@ def main(demo=False):
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
   camera_offset_helper = CameraOffsetHelper()
-  wide_camera_from_device_euler = load_mi8_wide_camera_extrinsics() if mi8_dual_camera else None
+  wide_camera_from_device_euler = None
   startup_sync_drops = 0
   max_startup_sync_drops = 5
-  if wide_camera_from_device_euler is not None:
-    cloudlog.warning(f"Mi 8 wide-camera extrinsics enabled (degrees): {np.degrees(wide_camera_from_device_euler)}")
-  elif mi8_dual_camera:
-    cloudlog.warning("Mi 8 wide-camera extrinsics are not configured; using the legacy identity transform")
 
 
   if demo:
@@ -423,6 +419,8 @@ def main(demo=False):
     lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
+      wide_camera_from_device_euler = (get_live_wide_camera_extrinsics(sm["extrinsicsCalibration"])
+                                       if mi8_dual_camera else None)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
       main_intrinsics = dc.wide_road.intrinsics if main_wide_camera else dc.narrow_road.intrinsics
       model_transform_main = get_warp_matrix(
@@ -521,7 +519,8 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
-      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof,
+                    live_calib_seen, wide_camera_from_device_euler if mi8_dual_camera else None)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
