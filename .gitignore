@@ -28,6 +28,9 @@ bin/
 *.d
 *.pem
 *.pyc
+
+# Local Mi 8 native test build output
+openpilot/sunnypilot/selfdrive/locationd/tests/test_gps_reset
 *.pyo
 .*.swp
 .*.swo

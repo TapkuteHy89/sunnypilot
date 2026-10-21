@@ -83,6 +83,14 @@ class DummyCarState:
     self.brakePressed = brakePressed
 
 
+class DummyCarrotMan:
+  def __init__(self, atc_type="none", cmd_index=0, cmd="", arg=""):
+    self.atcType = atc_type
+    self.carrotCmdIndex = cmd_index
+    self.carrotCmd = cmd
+    self.carrotArg = arg
+
+
 def set_lane_turn_params():
   params = Params()
   params.put("LaneTurnDesire", True)
@@ -122,3 +130,40 @@ class TestDesireHelperIntegration(OpenpilotTestCase):
     assert dh.lane_change_state == LaneChangeState.preLaneChange
     assert dh.lane_change_direction == LaneChangeDirection.left
     assert dh.desire == log.Desire.none
+
+  def test_carrot_turn_filters_transition_then_steers(self, set_lane_turn_params):
+    dh = DesireHelper()
+    dh.alc.lane_change_set_timer = AutoLaneChangeMode.NUDGE
+    carstate = DummyCarState(vEgo=12)
+    carrot = DummyCarrotMan(atc_type="turn left")
+
+    dh.update(carstate, True, 1.0, carrot_man=carrot)
+    assert dh.desire == log.Desire.none
+    dh.update(carstate, True, 1.0, carrot_man=carrot)
+    assert dh.desire == log.Desire.turnLeft
+
+  def test_physical_blinker_conflict_latches_until_route_clears(self, set_lane_turn_params):
+    dh = DesireHelper()
+    dh.alc.lane_change_set_timer = AutoLaneChangeMode.NUDGE
+    carstate = DummyCarState(vEgo=12, rightBlinker=True)
+    carrot = DummyCarrotMan(atc_type="turn left")
+
+    for _ in range(3):
+      dh.update(carstate, True, 1.0, carrot_man=carrot)
+    assert dh.desire != log.Desire.turnLeft
+
+    dh.update(carstate, True, 1.0, carrot_man=DummyCarrotMan())
+    carstate.rightBlinker = False
+    dh.update(carstate, True, 1.0, carrot_man=carrot)
+    dh.update(carstate, True, 1.0, carrot_man=carrot)
+    assert dh.desire == log.Desire.turnLeft
+
+  def test_remote_lane_change_command_has_short_hold(self, set_lane_turn_params):
+    dh = DesireHelper()
+    dh.alc.lane_change_set_timer = AutoLaneChangeMode.NUDGE
+    carstate = DummyCarState(vEgo=15, steeringPressed=True, steeringTorque=1)
+    carrot = DummyCarrotMan(cmd_index=1, cmd="LANECHANGE", arg="LEFT")
+
+    dh.update(carstate, True, 1.0, carrot_man=carrot)
+    assert dh.lane_change_direction == LaneChangeDirection.left
+    assert dh.carrot_atc_active

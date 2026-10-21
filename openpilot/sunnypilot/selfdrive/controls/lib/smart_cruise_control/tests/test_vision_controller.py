@@ -16,6 +16,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import BAIC_TARGET_LAT_ACCEL
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.vision_controller import SmartCruiseControlVision, _ENTERING_PRED_LAT_ACC_TH
 from openpilot.common.test import OpenpilotTestCase
 
@@ -207,3 +208,36 @@ class TestSmartCruiseControlVision(OpenpilotTestCase):
       assert self.scc_v.state == VisionState.enabled
 
   # TODO-SP: mock modelV2 data to test other states
+
+  def test_baic_profile_detects_curve_before_target_is_exceeded(self):
+    baic = SmartCruiseControlVision("baic")
+    n = len(ModelConstants.T_IDXS)
+    mdl = generate_modelV2()
+    mdl.modelV2.velocity.x = [1.0 for _ in range(n)]
+    mdl.modelV2.orientationRate.z = [0.85 for _ in range(n)]
+    self.sm["modelV2"] = mdl.modelV2
+
+    v_ego = 15.83
+    baic.update(self.sm, True, False, v_ego, 0.0, 16.11)
+    baic.update(self.sm, True, False, v_ego, 0.0, 16.11)
+
+    assert baic.state == VisionState.entering
+    assert baic.max_pred_lat_acc < BAIC_TARGET_LAT_ACCEL
+    assert baic.output_v_target > v_ego
+
+  def test_baic_uses_shared_requested_lateral_acceleration(self):
+    baic = SmartCruiseControlVision("baic")
+    n = len(ModelConstants.T_IDXS)
+    mdl = generate_modelV2()
+    # Use demand above the shared target to verify that the BAIC profile slows.
+    mdl.modelV2.velocity.x = [1.0 for _ in range(n)]
+    mdl.modelV2.orientationRate.z = [1.443 for _ in range(n)]
+    self.sm["modelV2"] = mdl.modelV2
+
+    v_ego = 49.0 / 3.6
+    baic.update(self.sm, True, False, v_ego, 0.0, 50.0 / 3.6)
+    baic.update(self.sm, True, False, v_ego, 0.0, 50.0 / 3.6)
+
+    assert baic.target_lat_acc == BAIC_TARGET_LAT_ACCEL == 1.0
+    assert baic.state == VisionState.entering
+    assert baic.output_v_target < v_ego

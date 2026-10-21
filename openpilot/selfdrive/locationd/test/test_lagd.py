@@ -8,7 +8,7 @@ from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import messaging, log
 from opendbc.car.structs import car
 from openpilot.selfdrive.locationd.lagd import LateralLagEstimator, retrieve_initial_lag, masked_normalized_cross_correlation, \
-                                               BLOCK_NUM_NEEDED, BLOCK_SIZE, MIN_OKAY_WINDOW_SEC, VERSION, MIN_LAG, MAX_LAG
+                                               BAIC_MIN_VEGO, BLOCK_NUM_NEEDED, BLOCK_SIZE, MIN_OKAY_WINDOW_SEC, VERSION, MIN_LAG, MAX_LAG, MIN_VEGO
 from openpilot.selfdrive.test.process_replay.migration import migrate, migrate_carParams
 from openpilot.selfdrive.locationd.test.test_locationd_scenarios import TEST_ROUTE
 from openpilot.common.params import Params
@@ -119,6 +119,13 @@ class TestLagd(OpenpilotTestCase):
     assert np.allclose(msg.lateralDelay.lateralDelayEstimate, estimator.initial_lag)
     assert msg.lateralDelay.validBlocks == 0
     assert msg.lateralDelay.calPerc == 0
+
+  def test_baic_uses_urban_speed_learning_gate(self):
+    baic_cp = car.CarParams(brand="baic", steerActuatorDelay=0.1)
+    other_cp = car.CarParams(brand="toyota", steerActuatorDelay=0.1)
+
+    assert LateralLagEstimator(baic_cp, DT).min_vego == BAIC_MIN_VEGO
+    assert LateralLagEstimator(other_cp, DT).min_vego == MIN_VEGO
 
   def test_estimator_basics(self, subtests):
     for lag_frames in range(LAGD_MIN_LAG_FRAMES, LAGD_MAX_LAG_FRAMES - 1):

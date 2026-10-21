@@ -51,7 +51,32 @@ enum {
   CAM_SENSOR_PACKET_OPCODE_SENSOR_PROBE = 3,
   CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG = 4,
   CAM_SENSOR_PACKET_OPCODE_SENSOR_NOP = 127,
+
+  // Implemented by the Mi 8 downstream kernel but missing from AGNOS UAPI.
+  CAM_ACTUATOR_PACKET_OPCODE_INIT = 0,
+  CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS = 1,
+
+  CAM_OIS_PACKET_OPCODE_INIT = 0,
 };
+
+// These OIS packet payloads are implemented by Xiaomi's downstream SDM845
+// kernel but are absent from the AGNOS userspace UAPI headers.
+struct cam_ois_opcode_v4l2 {
+  uint32_t prog;
+  uint32_t coeff;
+  uint32_t pheripheral;
+  uint32_t memory;
+} __attribute__((packed));
+
+struct cam_cmd_ois_info_v4l2 {
+  uint16_t slave_addr;
+  uint8_t i2c_freq_mode;
+  uint8_t cmd_type;
+  uint8_t ois_fw_flag;
+  uint8_t is_ois_calib;
+  char ois_name[32];
+  cam_ois_opcode_v4l2 opcode;
+} __attribute__((packed));
 
 std::optional<int32_t> device_acquire(int fd, int32_t session_handle, void *data, uint32_t num_resources=1);
 int device_config(int fd, int32_t session_handle, int32_t dev_handle, uint64_t packet_handle);
@@ -150,8 +175,11 @@ public:
   void sensors_start();
   void sensors_poke(int request_id);
   void sensors_i2c(const struct i2c_random_wr_payload* dat, int len, int op_code, bool data_word);
+  bool actuator_i2c(const struct i2c_random_wr_payload* dat, int len, int op_code, bool data_word);
 
   bool openSensor();
+  void configActuator(uint16_t focus_dac);
+  void configOIS();
   void configISP();
   void configICP();
   void configCSIPHY();
@@ -163,6 +191,11 @@ public:
   int ife_buf_depth = -1;
   bool open = false;
   bool enabled = true;
+  // Selected from the sensor's factory ABF gain profiles before each IFE update.
+  int ife_abf34_profile = 0;
+  // Initial IFE configuration programs profile 0. Update DMI only when AE
+  // actually crosses an ABF profile boundary.
+  int ife_abf34_applied_profile = 0;
   CameraConfig cc;
   std::unique_ptr<const SensorInfo> sensor;
 
@@ -175,9 +208,13 @@ public:
 
   unique_fd sensor_fd;
   unique_fd csiphy_fd;
+  unique_fd actuator_fd;
+  unique_fd ois_fd;
 
   int32_t session_handle = -1;
   int32_t sensor_dev_handle = -1;
+  int32_t actuator_dev_handle = -1;
+  int32_t ois_dev_handle = -1;
   int32_t isp_dev_handle = -1;
   int32_t icp_dev_handle = -1;
   int32_t csiphy_dev_handle = -1;
@@ -188,6 +225,7 @@ public:
   SpectraBuf ife_gamma_lut;
   SpectraBuf ife_linearization_lut;
   SpectraBuf ife_vignetting_lut;
+  SpectraBuf ife_abf34_lut;
 
   SpectraBuf bps_cmd;
   SpectraBuf bps_cdm_buffer;
@@ -205,9 +243,9 @@ public:
   int buf_handle_raw[MAX_IFE_BUFS] = {};
   int sync_objs_ife[MAX_IFE_BUFS] = {};
   int sync_objs_bps[MAX_IFE_BUFS] = {};
-  uint64_t last_valid_request_id = 0;
+  uint64_t request_id_last = 0;
   uint64_t last_requeue_ts = 0;
-  uint64_t last_valid_ife_frame_id = 0;
+  uint64_t frame_id_raw_last = 0;
   int invalid_request_count = 0;
   bool skip_expected = true;
 
@@ -216,10 +254,10 @@ public:
 
 private:
   void clearAndRequeue(uint64_t from_request_id);
-  bool validateEvent(uint64_t request_id, uint64_t ife_frame_id);
+  bool validateEvent(uint64_t request_id, uint64_t frame_id_raw);
   bool waitForFrameReady(uint64_t request_id);
-  bool processFrame(int buf_idx, uint64_t request_id, uint64_t ife_frame_id, uint64_t timestamp);
-  static bool syncFirstFrame(int camera_id, uint64_t request_id, uint64_t ife_frame_id, uint64_t timestamp, bool staggered);
+  bool processFrame(int buf_idx, uint64_t request_id, uint64_t frame_id_raw, uint64_t timestamp);
+  static bool syncFirstFrame(int camera_id, uint64_t request_id, uint64_t raw_id, uint64_t timestamp, bool staggered);
   struct SyncData {
     uint64_t timestamp;
     uint64_t frame_id_offset = 0;
@@ -227,6 +265,7 @@ private:
   };
   inline static std::map<int, SyncData> camera_sync_data;
   inline static bool first_frame_synced = false;
+  inline static uint64_t sync_epoch_timestamp = 0;
 
   // a mode for stressing edge cases: realignment, sync failures, etc.
   inline bool stress_test(std::string log) {

@@ -23,6 +23,14 @@ OFFSET_MAX = 10.0
 OFFSET_LOWERED_MAX = 8.0
 MIN_ACTIVE_SPEED = 1.0
 LOW_ACTIVE_SPEED = 10.0
+BAIC_STEER_RATIO_MIN_MULTIPLIER = 0.85
+BAIC_STEER_RATIO_MAX_MULTIPLIER = 1.20
+
+
+def get_steer_ratio_bounds(CP: car.CarParams) -> tuple[float, float]:
+  if CP.brand == "baic":
+    return BAIC_STEER_RATIO_MIN_MULTIPLIER * CP.steerRatio, BAIC_STEER_RATIO_MAX_MULTIPLIER * CP.steerRatio
+  return 0.5 * CP.steerRatio, 2.0 * CP.steerRatio
 
 
 class VehicleParamsLearner:
@@ -43,7 +51,7 @@ class VehicleParamsLearner:
       stiffness_rear=CP.tireStiffnessRearPerMass
     )
 
-    self.min_sr, self.max_sr = 0.5 * CP.steerRatio, 2.0 * CP.steerRatio
+    self.min_sr, self.max_sr = get_steer_ratio_bounds(CP)
 
     self.calibrator = PoseCalibrator()
 
@@ -139,6 +147,11 @@ class VehicleParamsLearner:
       self.reset(self.kf.t)
       x = self.kf.x
 
+    # The generic 0.5x..2.0x validity range allowed the BAIC estimate to drift
+    # from its 15.0 baseline to 18.9. Clamp the filter state so controlsd never
+    # consumes or persists an out-of-envelope steering ratio.
+    x[States.STEER_RATIO] = np.clip(x[States.STEER_RATIO], self.min_sr, self.max_sr)
+
     self.avg_angle_offset = np.clip(np.degrees(x[States.ANGLE_OFFSET].item()),
                                 self.avg_angle_offset - MAX_ANGLE_OFFSET_DELTA, self.avg_angle_offset + MAX_ANGLE_OFFSET_DELTA)
     self.angle_offset = np.clip(np.degrees(x[States.ANGLE_OFFSET].item() + x[States.ANGLE_OFFSET_FAST].item()),
@@ -215,7 +228,7 @@ def retrieve_initial_vehicle_params(params: Params, CP: car.CarParams, replay: b
           raise Exception("Car model mismatch")
 
         # Check if starting values are sane
-        min_sr, max_sr = 0.5 * CP.steerRatio, 2.0 * CP.steerRatio
+        min_sr, max_sr = get_steer_ratio_bounds(CP)
         steer_ratio_sane = min_sr <= lp.steerRatio <= max_sr
         if not steer_ratio_sane:
           raise Exception(f"Invalid starting values found {lp}")

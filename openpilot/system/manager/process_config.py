@@ -6,6 +6,7 @@ from opendbc.car.structs import car
 from openpilot.cereal import custom
 from openpilot.common.params import Params
 from openpilot.common.hardware import PC, COMMA_HARDWARE
+from openpilot.common.hardware.comma.hardware import is_mi8_hardware
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
 
@@ -15,6 +16,13 @@ from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
+MI8_HARDWARE = COMMA_HARDWARE and is_mi8_hardware()
+
+# The BAIC port is identified reliably from passive CAN. The Mi 8 has no
+# validated firmware database, so active UDS probing only produces expected
+# negative responses and can disturb ECUs during startup.
+if MI8_HARDWARE:
+  os.environ["SKIP_FW_QUERY"] = "1"
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -32,11 +40,18 @@ def logging(started: bool, params: Params, CP: car.CarParams) -> bool:
 def ublox_available() -> bool:
   return os.path.exists('/dev/ttyHS0') and not os.path.exists('/persist/comma/use-quectel-gps')
 
+def broadcom_available() -> bool:
+  return os.path.exists('/persist/comma/use-broadcom-gps')
+
 def ublox(started: bool, params: Params, CP: car.CarParams) -> bool:
   use_ublox = ublox_available()
-  if use_ublox != params.get_bool("UbloxAvailable"):
-    params.put_bool("UbloxAvailable", use_ublox, block=True)
+  use_external_gps = use_ublox or broadcom_available()
+  if use_external_gps != params.get_bool("UbloxAvailable"):
+    params.put_bool("UbloxAvailable", use_external_gps, block=True)
   return started and use_ublox
+
+def broadcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and broadcom_available()
 
 def joystick(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("JoystickDebugMode")
@@ -54,7 +69,7 @@ def not_long_maneuver(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and not params.get_bool("LongitudinalManeuverMode")
 
 def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return started and not ublox_available()
+  return started and not (ublox_available() or broadcom_available())
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
@@ -110,26 +125,28 @@ def and_(*fns):
   return lambda *args: operator.and_(*(fn(*args) for fn in fns))
 
 procs = [
-  DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
+  DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid", enabled=not MI8_HARDWARE),
 
-  NativeProcess("loggerd", "openpilot/system/loggerd", ["./loggerd"], logging),
-  NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
-  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(livestream, notcar)),
+  NativeProcess("loggerd", "openpilot/system/loggerd", ["python3", "./mi8_loggerd.py"] if MI8_HARDWARE else ["./loggerd"], logging),
+  NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad, enabled=not MI8_HARDWARE),
+  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(livestream, notcar), enabled=not MI8_HARDWARE),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
 
-  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, livestream), enabled=not WEBCAM),
+  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad_mi8"], always_run, enabled=not WEBCAM),
+  PythonProcess("camera_awbd", "openpilot.system.camerad.camera_awbd", always_run, enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.system.camerad.webcam.camerad", driverview, enabled=WEBCAM),
-  PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
-  PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
-  PythonProcess("micd", "openpilot.system.micd", iscar),
+  PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin" and not MI8_HARDWARE),
+  PythonProcess("journald", "openpilot.system.journald", only_onroad, enabled=platform.system() != "Darwin" and not MI8_HARDWARE),
+  PythonProcess("micd", "openpilot.system.micd", iscar, enabled=not MI8_HARDWARE),
   PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC),
 
   PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
   PythonProcess("navd", "openpilot.selfdrive.navigation.navd", navigation),
   PythonProcess("mapsd", "openpilot.selfdrive.navigation.mapsd", navigation),
-  PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
+  PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview,
+                enabled=(WEBCAM or not PC) and not MI8_HARDWARE),
 
-  PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
+  PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=(not PC or MI8_HARDWARE)),
   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run),
   PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview),
   PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
@@ -141,8 +158,10 @@ procs = [
   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
-  PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
+  PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview,
+                enabled=(WEBCAM or not PC) and not MI8_HARDWARE),
   PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=COMMA_HARDWARE),
+  PythonProcess("broadcomgpsd", "openpilot.system.broadcomgpsd.broadcomgpsd", broadcomgps),
   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
   PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),
@@ -155,9 +174,12 @@ procs = [
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.common.hardware.comma.modem", always_run, enabled=COMMA_HARDWARE),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
-  PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
-  PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready),
-  PythonProcess("statsd", "openpilot.sunnypilot.system.statsd", always_run),
+  # Mi 8 deployments are staged transactionally over SSH and intentionally do
+  # not carry a writable Git checkout on-device. Running updated there only
+  # crash-loops on `git rev-parse` and must never replace the validated port.
+  PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC and not MI8_HARDWARE),
+  PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready, enabled=not MI8_HARDWARE),
+  PythonProcess("statsd", "openpilot.sunnypilot.system.statsd", always_run, enabled=not MI8_HARDWARE),
 
   # debug procs
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
@@ -186,6 +208,10 @@ procs += [
 
   # locationd
   NativeProcess("locationd_llk", "openpilot/sunnypilot/selfdrive/locationd", ["./locationd"], only_onroad),
+
+  # Carrot/NaviPilot phone projection and navigation.
+  PythonProcess("carrot_man", "openpilot.selfdrive.carrot.carrot_man", only_onroad),
+  PythonProcess("carrot_server", "openpilot.selfdrive.carrot.carrot_server", always_run),
 ]
 
 if os.path.exists("../../sunnypilot/sunnylink/uploader.py"):

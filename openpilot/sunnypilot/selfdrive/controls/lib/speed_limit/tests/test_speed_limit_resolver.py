@@ -8,6 +8,8 @@ import random
 import time
 
 from openpilot.common.parameterized import parameterized
+from openpilot.common.constants import CV
+from openpilot.common.params import Params
 
 from openpilot.cereal import custom
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
@@ -74,6 +76,28 @@ def resolver_class():
 
 
 class TestSpeedLimitResolverValidation(OpenpilotTestCase):
+
+  def test_vietnam_uses_live_vietmap_road_limit(self, mocker):
+    Params().put("OsmLocationName", "VN")
+    resolver = SpeedLimitResolver()
+    resolver.policy = Policy.map_data_only
+
+    carrot_man = create_mock({'nRoadLimitSpeed': 50}, mocker)
+    car_state_sp = create_mock({'speedLimit': 0.}, mocker)
+    sm_mock = mocker.MagicMock()
+    sm_mock.alive = {'carrotMan': True}
+    sm_mock.valid = {'carrotMan': True}
+    sm_mock.__getitem__.side_effect = lambda key: {
+      'carrotMan': carrot_man,
+      'carStateSP': car_state_sp,
+    }[key]
+
+    resolver.update(0., sm_mock)
+
+    assert resolver.vietmap_exclusive
+    assert resolver.speed_limit == 50 * CV.KPH_TO_MS
+    assert resolver.speed_limit_valid
+    assert resolver.source == SpeedLimitSource.map
 
   @parameterized.expand(list(Policy), names=["policy"])
   def test_initial_state(self, resolver_class, policy):

@@ -62,6 +62,19 @@ for cam_w, cam_h in camera_configs:
          f'--output {warp_pkl_path}')
   lenv.Command(warp_pkl_path, tinygrad_files + warp_deps + [Value(cmd)], cmd)
 
+# The Mi 8 road cameras have different native resolutions. Build one warp per
+# stream so modeld can preserve both fields of view instead of resizing or
+# discarding the wide camera before the model input.
+if arch == 'comma_arm64':
+  for cam_w, cam_h in ((2104, 1560), (1920, 1080)):
+    warp_pkl_path = File(f"models/driving_warp_{cam_w}x{cam_h}_single_tinygrad.pkl").abspath
+    stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
+    cmd = (f'{tg_flags} {mac_brew_string} {taskset}python3 "{compiler}/compile_warp.py" '
+           f'--frame {cam_w},{cam_h},{stride},{y_height},{uv_height},{stride * (y_height + uv_height)} '
+           f'--warp-to {model_w}x{model_h} --layout yuv420 --frames 1 '
+           f'--output {warp_pkl_path}')
+    lenv.Command(warp_pkl_path, tinygrad_files + warp_deps + [Value(cmd)], cmd)
+
 dm_w, dm_h = DM_INPUT_SIZE
 for cam_w, cam_h in [] if os.getenv('SKIP_TINYGRAD_COMPILE') else camera_configs:
   dm_pkl_path = File(f"models/dm_warp_{cam_w}x{cam_h}_tinygrad.pkl").abspath

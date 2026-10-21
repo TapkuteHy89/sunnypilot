@@ -23,7 +23,7 @@
 #define POSENET_STD_HIST_HALF 20
 
 enum LocalizerGnssSource {
-  UBLOX, QCOM
+  UBLOX, QCOM, BROADCOM
 };
 
 class Localizer {
@@ -90,6 +90,7 @@ private:
   std::map<std::string, double> observation_values_invalid;
   bool standstill = true;
   int32_t orientation_reset_count = 0;
+  int32_t position_reset_count = 0;
   float gps_std_factor;
   float gps_variance_factor;
   float gps_vertical_variance_factor;

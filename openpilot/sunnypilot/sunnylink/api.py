@@ -5,6 +5,7 @@ import time
 import jwt
 from typing import cast
 from datetime import datetime, timedelta, UTC
+from pathlib import Path
 
 from openpilot.common.api.base import BaseApi
 from openpilot.common.params import Params
@@ -15,6 +16,9 @@ API_HOST = os.getenv('SUNNYLINK_API_HOST', 'https://stg.api.sunnypilot.ai')
 UNREGISTERED_SUNNYLINK_DONGLE_ID = "UnregisteredDevice"
 MAX_RETRIES = 6
 CRASH_LOG_DIR = Paths.crash_log_root()
+SUNNYLINK_KEY_DIR = Path(Paths.persist_root()) / "sunnylink"
+SUNNYLINK_PRIVATE_KEY = SUNNYLINK_KEY_DIR / "id_rsa"
+SUNNYLINK_PUBLIC_KEY = SUNNYLINK_KEY_DIR / "id_rsa.pub"
 
 
 class SunnylinkApi(BaseApi):
@@ -23,6 +27,14 @@ class SunnylinkApi(BaseApi):
     self.user_agent = "sunnypilot-"
     self.spinner = None
     self.params = Params()
+
+  @staticmethod
+  def get_key_pair() -> tuple[str, str, str] | tuple[None, None, None]:
+    # Sunnylink registrations have their own persistent identity. Reusing the
+    # comma key signs tokens for the wrong backend record after migration.
+    if SUNNYLINK_PRIVATE_KEY.is_file() and SUNNYLINK_PUBLIC_KEY.is_file():
+      return "RS256", SUNNYLINK_PRIVATE_KEY.read_text(), SUNNYLINK_PUBLIC_KEY.read_text()
+    return BaseApi.get_key_pair()
 
   def api_get(self, endpoint, method='GET', timeout=10, access_token=None, session=None, json=None, **kwargs):
     if not self.params.get_bool("SunnylinkEnabled"):
@@ -77,7 +89,7 @@ class SunnylinkApi(BaseApi):
     if sunnylink_dongle_id not in (None, UNREGISTERED_SUNNYLINK_DONGLE_ID):
       return sunnylink_dongle_id
 
-    jwt_algo, private_key, public_key = BaseApi.get_key_pair()
+    jwt_algo, private_key, public_key = self.get_key_pair()
 
     start_time = time.monotonic()
     successful_registration = False

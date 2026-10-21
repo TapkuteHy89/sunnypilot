@@ -89,6 +89,29 @@ def main() -> None:
   do_exit = False
   signal.signal(signal.SIGINT, signal_handler)
 
+  # Mi 8 uses an external Black Panda F4 running the validated legacy
+  # firmware. Its packet ABI is handled by the C++ compatibility transport;
+  # never run the current Python health decoder or firmware flasher on it.
+  try:
+    with open("/sys/firmware/devicetree/base/model") as f:
+      mi8_hardware = not f.read().strip('\x00').lower().startswith("comma ")
+  except OSError:
+    mi8_hardware = False
+
+  if mi8_hardware:
+    while not do_exit:
+      panda_serials = Panda.list()
+      if len(panda_serials) == 1:
+        cloudlog.info(f"Mi8 external Panda found, connecting without firmware update: {panda_serials}")
+        os.environ['MANAGER_DAEMON'] = 'pandad'
+        os.environ['BOARDD_SKIP_FW_CHECK'] = '1'
+        process = subprocess.Popen(["./pandad", panda_serials[0]], cwd=os.path.join(BASEDIR, "openpilot/selfdrive/pandad"))
+        process.wait()
+      else:
+        cloudlog.warning(f"Mi8 expects exactly one external Panda, found: {panda_serials}")
+        time.sleep(1)
+    return
+
   # check health for lost heartbeat
   try:
     for s in Panda.list():

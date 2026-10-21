@@ -92,12 +92,16 @@ class SelfdriveD:
     self.gps_location_service = get_gps_location_service(self.params)
     self.gps_packets = [self.gps_location_service]
     self.sensor_packets = ["accelerometer", "gyroscope"]
-    self.camera_packets = ["narrowRoadCameraState", "cabinCameraState", "wideRoadCameraState"]
+    no_driver_monitoring = os.getenv("NO_DM") is not None
+    self.camera_packets = ["narrowRoadCameraState", "wideRoadCameraState"] if no_driver_monitoring else \
+                          ["narrowRoadCameraState", "cabinCameraState", "wideRoadCameraState"]
 
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
     ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan'] + ['modelDataV2SP', 'longitudinalPlanSP']
+    if no_driver_monitoring:
+      ignore += ['driverMonitoringState']
     if SIMULATION:
       ignore += ['cabinCameraState', 'managerState']
     if REPLAY:
@@ -518,7 +522,9 @@ class SelfdriveD:
         self.params.put('LongitudinalPersonality', self.personality)
         self.events.add(EventName.personalityChanged)
 
-    self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric)
+    plan_valid = self.sm.alive['longitudinalPlanSP'] and self.sm.valid['longitudinalPlanSP']
+    self.icbm.run(CS, self.sm['carControl'], self.sm['longitudinalPlanSP'], self.is_metric,
+                  plan_valid=plan_valid, force_decel=self.sm['controlsState'].forceDecel)
 
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)

@@ -14,13 +14,20 @@ public:
   static std::string get_name() {
     static const std::string name = []() {
       std::string model = util::read_file("/sys/firmware/devicetree/base/model");
-      return util::strip(model.substr(std::string("comma ").size()));
+      model = util::strip(model);
+      if (model.rfind("comma ", 0) == 0) {
+        return util::strip(model.substr(std::string("comma ").size()));
+      }
+      // Xiaomi Mi 8 (dipper) exposes the Tici compatibility markers but its
+      // device-tree model is not a comma product name.
+      return std::string("tici");
     }();
     return name;
   }
 
   static cereal::InitData::DeviceType get_device_type() {
     static const std::map<std::string, cereal::InitData::DeviceType> device_map = {
+      {"tici", cereal::InitData::DeviceType::TICI},
       {"tizi", cereal::InitData::DeviceType::TIZI},
       {"mici", cereal::InitData::DeviceType::MICI}
     };
@@ -49,7 +56,8 @@ public:
 
   static void set_ir_power(int percent) {
     auto device = get_device_type();
-    if (device == cereal::InitData::DeviceType::TIZI) {
+    if (device == cereal::InitData::DeviceType::TICI ||
+        device == cereal::InitData::DeviceType::TIZI) {
       return;
     }
 

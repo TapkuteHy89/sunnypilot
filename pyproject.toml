@@ -39,6 +39,9 @@ dependencies = [
   "PyJWT[crypto]",
   "websocket_client",
 
+  # carrot web/navigation bridge
+  "aiohttp==3.13.0",
+
   # joystickd
   "inputs",
 

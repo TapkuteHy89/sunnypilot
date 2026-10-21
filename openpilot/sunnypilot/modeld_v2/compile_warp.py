@@ -17,16 +17,28 @@ def main():
   parser.add_argument("--frame", required=True, help="width,height,stride,y_height,uv_height,buffer_size")
   parser.add_argument("--warp-to", required=True, help="model input WxH")
   parser.add_argument("--output", required=True)
+  parser.add_argument("--legacy-interface", action="store_true",
+                      help="emit the four-input frame/big_frame/tfm/big_tfm API used by LegacyModelAdapter")
   args = parser.parse_args()
 
   from examples.openpilot.compile_warp import make_frame_prepare, parse_frame, parse_size
   from tinygrad import Device, Tensor, TinyJit
   frame = parse_frame(args.frame)
-  warp = make_frame_prepare(frame, *parse_size(args.warp_to))
-  run = TinyJit(lambda input_frame, M_inv: Tensor.stack(*(warp(input_frame[i], M_inv[i]) for i in range(2))), prune=True)
   rng = np.random.default_rng(42)
-  inputs = {"input_frame": Tensor(rng.integers(0, 256, (2, frame.size), dtype=np.uint8), device=Device.DEFAULT).realize(),
-            "M_inv": Tensor((rng.standard_normal((2, 3, 3)) * 8).astype(np.float32), device=Device.DEFAULT).realize()}
+  if args.legacy_interface:
+    from openpilot.sunnypilot.modeld_v2.stock_dependencies import make_warp
+    run = TinyJit(make_warp(frame, *parse_size(args.warp_to)), prune=True)
+    inputs = {
+      "tfm": Tensor((rng.standard_normal((3, 3)) * 8).astype(np.float32), device=Device.DEFAULT).realize(),
+      "big_tfm": Tensor((rng.standard_normal((3, 3)) * 8).astype(np.float32), device=Device.DEFAULT).realize(),
+      "frame": Tensor(rng.integers(0, 256, frame.size, dtype=np.uint8), device=Device.DEFAULT).realize(),
+      "big_frame": Tensor(rng.integers(0, 256, frame.size, dtype=np.uint8), device=Device.DEFAULT).realize(),
+    }
+  else:
+    warp = make_frame_prepare(frame, *parse_size(args.warp_to))
+    run = TinyJit(lambda input_frame, M_inv: Tensor.stack(*(warp(input_frame[i], M_inv[i]) for i in range(2))), prune=True)
+    inputs = {"input_frame": Tensor(rng.integers(0, 256, (2, frame.size), dtype=np.uint8), device=Device.DEFAULT).realize(),
+              "M_inv": Tensor((rng.standard_normal((2, 3, 3)) * 8).astype(np.float32), device=Device.DEFAULT).realize()}
   with record_kernel_linear() as recorded:
     run(**inputs)
     run(**inputs)
@@ -36,7 +48,8 @@ def main():
   PlainJit(*part)
   specs = {"input_frame": ((2, frame.size), "|u1", Device.DEFAULT), "M_inv": ((2, 3, 3), "<f4", Device.DEFAULT)}
   write_bundle(args.output, {"run": part}, {"input_specs": specs, "metadata": {}})
-  print(f"Saved warp to {args.output} ({len(part[0]['calls'])} kernels)")
+  interface = "legacy" if args.legacy_interface else "batched"
+  print(f"Saved {interface} warp to {args.output} ({len(part[0]['calls'])} kernels)")
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_HW
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
 from openpilot.common.hardware import HARDWARE, COMMA_HARDWARE
+from openpilot.common.hardware.comma.hardware import is_mi8_hardware
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.git import get_short_branch
 from openpilot.common.hardware.usb import CHESTNUT_FW_VERSION, CHESTNUT_USB_PRODUCT, get_usb_state, get_usb_topology, is_chestnut_usb_id, set_usb_state
@@ -380,7 +381,11 @@ def hardware_thread(end_event, hw_queue) -> None:
     # - TIZI, or
     # - TICI and channel_type is "tici"
     build_metadata = get_build_metadata()
-    is_unsupported_combo = COMMA_HARDWARE and HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici"
+    # Mi 8 intentionally reuses the tici hardware interface for SDM845, but it
+    # is not a comma three and is deployed from a validated local staging tree.
+    # Do not apply the comma-three release-channel gate to this port.
+    is_unsupported_combo = (COMMA_HARDWARE and not is_mi8_hardware() and
+                            HARDWARE.get_device_type() == "tici" and build_metadata.channel_type != "tici")
     startup_conditions["not_tici"] = not is_unsupported_combo
     onroad_conditions["not_tici"] = not is_unsupported_combo
     set_offroad_alert("Offroad_TiciSupport", is_unsupported_combo, extra_text=build_metadata.channel)

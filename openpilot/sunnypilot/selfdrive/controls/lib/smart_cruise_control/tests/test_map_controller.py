@@ -70,6 +70,19 @@ class TestSmartCruiseControlMap(OpenpilotTestCase):
 
     self.scc_m.update(self.sm, True, False, 25.0, 0.0, 30.0)
 
+    # The map controller publishes its distance/jerk-derived target directly;
+    # the longitudinal planner owns the final acceleration and jerk ramp.
     self.assertAlmostEqual(self.scc_m.v_target, 24.0, delta=24.0 * 1e-6)
+
+  def test_retains_curve_target_below_target_speed(self):
+    waypoint_lon_deg = (10.0 / R) * (180.0 / math.pi)
+    self.mem_params.put("MapTargetVelocities",
+                        json.dumps([{"latitude": 0.0, "longitude": waypoint_lon_deg, "velocity": 15.0}]), block=True)
+
+    self.scc_m.update(self.sm, True, False, 14.0, 0.0, 20.0)
+    self.scc_m.update(self.sm, True, False, 14.0, 0.0, 20.0)
+
+    assert self.scc_m.is_active
+    self.assertAlmostEqual(self.scc_m.output_v_target, 15.0)
 
   # TODO-SP: mock data from modelV2 to test other states

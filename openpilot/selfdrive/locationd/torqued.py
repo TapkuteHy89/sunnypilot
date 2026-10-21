@@ -36,7 +36,8 @@ MIN_BUCKET_POINTS = np.array([100, 300, 500, 500, 500, 500, 300, 100])
 MIN_ENGAGE_BUFFER = 2  # secs
 
 VERSION = 1  # bump this to invalidate old parameter caches
-ALLOWED_CARS = ['toyota', 'hyundai', 'rivian', 'honda', 'volkswagen']
+ALLOWED_CARS = ['toyota', 'hyundai', 'rivian', 'honda', 'volkswagen', 'baic']
+BAIC_LAT_ACCEL_OFFSET_LIMIT = 0.15
 
 
 def slope2rot(slope):
@@ -79,6 +80,7 @@ class TorqueEstimator(ParameterEstimator, TorqueEstimatorExt):
     self.offline_latAccelFactor = 0.0
     self.resets = 0.0
     self.use_params = CP.brand in ALLOWED_CARS and CP.lateralTuning.which() == 'torque'
+    self.lat_accel_offset_limit = BAIC_LAT_ACCEL_OFFSET_LIMIT if CP.brand == 'baic' else np.inf
 
     if CP.lateralTuning.which() == 'torque':
       self.offline_friction = CP.lateralTuning.torque.friction
@@ -117,7 +119,8 @@ class TorqueEstimator(ParameterEstimator, TorqueEstimatorExt):
           if cache_ltp.valid:
             initial_params = {
               'latAccelFactor': cache_ltp.latAccelFactorFiltered,
-              'latAccelOffset': cache_ltp.latAccelOffsetFiltered,
+              'latAccelOffset': float(np.clip(cache_ltp.latAccelOffsetFiltered,
+                                              -self.lat_accel_offset_limit, self.lat_accel_offset_limit)),
               'frictionCoefficient': cache_ltp.frictionCoefficientFiltered
             }
           cached_points: list[list[float]] = [list(point) for point in cache_ltp.points]
@@ -236,6 +239,7 @@ class TorqueEstimator(ParameterEstimator, TorqueEstimatorExt):
         else:
           lateralTorqueParameters.valid = True
           latAccelFactor = np.clip(latAccelFactor, self.min_lataccel_factor, self.max_lataccel_factor)
+          latAccelOffset = np.clip(latAccelOffset, -self.lat_accel_offset_limit, self.lat_accel_offset_limit)
           frictionCoeff = np.clip(frictionCoeff, self.min_friction, self.max_friction)
           self.update_params({'latAccelFactor': latAccelFactor, 'latAccelOffset': latAccelOffset, 'frictionCoefficient': frictionCoeff})
 

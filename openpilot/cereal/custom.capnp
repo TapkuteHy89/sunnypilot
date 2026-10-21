@@ -303,6 +303,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccVision @1;
     sccMap @2;
     speedLimitAssist @3;
+    carrot @4;
   }
 
   struct E2eAlerts {
@@ -473,13 +474,74 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   }
 }
 
-struct CustomReserved10 @0xcb9fd56c7057593a {
+struct CarrotMan @0xcb9fd56c7057593a {
+  activeCarrot @0 :Int32;
+  nRoadLimitSpeed @1 :Int32;
+  remote @2 :Text;
+  xSpdType @3 :Int32;
+  xSpdLimit @4 :Int32;
+  xSpdDist @5 :Int32;
+  xSpdCountDown @6 :Int32;
+  xTurnInfo @7 :Int32;
+  xDistToTurn @8 :Int32;
+  xTurnCountDown @9 :Int32;
+  atcType @10 :Text;
+  vTurnSpeed @11 :Int32;
+  szPosRoadName @12 :Text;
+  szTBTMainText @13 :Text;
+  desiredSpeed @14 :Int32;
+  desiredSource @15 :Text;
+  carrotCmdIndex @16 :Int32;
+  carrotCmd @17 :Text;
+  carrotArg @18 :Text;
+  xPosLat @19 :Float32;
+  xPosLon @20 :Float32;
+  xPosAngle @21 :Float32;
+  xPosSpeed @22 :Float32;
+  trafficState @23 :Int32;
+  nGoPosDist @24 :Int32;
+  nGoPosTime @25 :Int32;
+  szSdiDescr @26 :Text;
+  naviPaths @27 :Text;
+  leftSec @28 :Int32;
+  xDistToTurnNav @29 :Int32;
+  xDistToTurnNavLast @30 :Int32;
+  xDistToTurnMax @31 :Int32;
+  xDistToTurnMaxCnt @32 :Int32;
+  xLeftTurnSec @33 :Int32;
+  roadCate @34 :Int32;
+  extBlinker @35 :Int32;
+  extState @36 :Int32;
+  leftBlind @37 :Int32;
+  rightBlind @38 :Int32;
+  trafficCountdown @39 :Int32;
+  szGoalName @40 :Text;
+  szTBTMainTextNext @41 :Text;
+  szNearDirName @42 :Text;
 }
 
-struct CustomReserved11 @0xc2243c65e0340384 {
+struct AmapNavi @0xc2243c65e0340384 {
+  leftBlind @0 :Int32;
+  rightBlind @1 :Int32;
 }
 
-struct CustomReserved12 @0x9ccdc8676701b412 {
+struct NavInstructionCarrot @0x9ccdc8676701b412 {
+  maneuverPrimaryText @0 :Text;
+  maneuverSecondaryText @1 :Text;
+  maneuverDistance @2 :Float32;
+  maneuverType @3 :Text;
+  maneuverModifier @4 :Text;
+  distanceRemaining @5 :Float32;
+  timeRemaining @6 :Float32;
+  timeRemainingTypical @7 :Float32;
+  speedLimit @8 :Float32;
+  allManeuvers @9 :List(Maneuver);
+
+  struct Maneuver {
+    distance @0 :Float32;
+    type @1 :Text;
+    modifier @2 :Text;
+  }
 }
 
 struct CustomReserved13 @0xcd96dafb67a082d0 {

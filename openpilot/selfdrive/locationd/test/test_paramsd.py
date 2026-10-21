@@ -1,9 +1,10 @@
 import random
 import numpy as np
 
+from opendbc.car.structs import car
 from openpilot.common.test import OpenpilotTestCase
 from openpilot.cereal import messaging
-from openpilot.selfdrive.locationd.paramsd import retrieve_initial_vehicle_params
+from openpilot.selfdrive.locationd.paramsd import get_steer_ratio_bounds, retrieve_initial_vehicle_params
 from openpilot.selfdrive.locationd.models.car_kf import CarKalman
 from openpilot.selfdrive.locationd.test.test_locationd_scenarios import TEST_ROUTE
 from openpilot.selfdrive.test.process_replay.migration import migrate, migrate_carParams
@@ -21,6 +22,12 @@ def get_random_vehicle_parameters(CP):
 
 
 class TestParamsd(OpenpilotTestCase):
+  def test_baic_steer_ratio_bounds(self):
+    CP = car.CarParams.new_message()
+    CP.brand = "baic"
+    CP.steerRatio = 15.0
+    assert get_steer_ratio_bounds(CP) == (12.75, 18.0)
+
   def test_read_saved_params(self):
     params = Params()
 

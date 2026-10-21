@@ -20,6 +20,7 @@
 #define MAX_IR_PANDA_VAL 50
 #define CUTOFF_IL 400
 #define SATURATE_IL 1000
+#define ALT_EXP_MADS_DISENGAGE_LATERAL_ON_BRAKE 2048
 
 ExitHandler do_exit;
 
@@ -32,8 +33,21 @@ bool check_connected(Panda *panda) {
 }
 
 bool process_mads_heartbeat(SubMaster *sm) {
+  const auto &car_params = (*sm)["carParams"].getCarParams();
+  const int &alt_exp = car_params.getAlternativeExperience();
+  const bool disengage_lateral_on_brake = (alt_exp & ALT_EXP_MADS_DISENGAGE_LATERAL_ON_BRAKE) != 0;
+
   const auto &mads = (*sm)["selfdriveStateSP"].getSelfdriveStateSP().getMads();
-  return sm->allAliveAndValid({"selfdriveStateSP"}) && mads.getEnabled();
+  // BAIC physically isolates MPC2 while the host heartbeat is asserted. The
+  // persistent MADS enabled bit therefore cannot be used as the takeover
+  // signal: it remains true while MADS is paused/off and would block the OEM
+  // path without a host replacement. Track the live active state instead.
+  const bool heartbeat_tracks_active = disengage_lateral_on_brake || car_params.getBrand() == "baic";
+  const bool heartbeat_type = heartbeat_tracks_active ? mads.getActive() : mads.getEnabled();
+  // CarParams is a latched, one-shot message. Requiring it to stay "alive"
+  // would make the heartbeat drop after startup even though its value remains
+  // valid in SubMaster.
+  return sm->allAliveAndValid({"selfdriveStateSP"}) && heartbeat_type;
 }
 
 Panda *connect(std::string serial) {
@@ -382,7 +396,7 @@ void pandad_run(Panda *panda) {
   std::thread send_thread(can_send_thread, panda, fake_send);
 
   RateKeeper rk("pandad", 100);
-  SubMaster sm({"selfdriveState", "deviceState", "selfdriveStateSP"});
+  SubMaster sm({"selfdriveState", "deviceState", "selfdriveStateSP", "carParams"});
   PubMaster pm({"can", "pandaStates", "peripheralState"});
   PandaSafety panda_safety(panda);
   bool engaged = false;

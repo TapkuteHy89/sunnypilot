@@ -94,6 +94,21 @@ def polling_loop(sensor: Sensor, service: str, event: threading.Event) -> None:
 def main() -> None:
   config_realtime_process([1, ], 1)
 
+  # Xiaomi Mi 8 (dipper) has an ICM-20690 behind the SLPI/QMI sensor
+  # service. Requesting comma's LSM6DS3 GPIO line 84 on this kernel resolves
+  # to an invalid TLMM register and causes a kernel synchronous external
+  # abort. Route the phone to the already validated QMI transport before any
+  # gpiochip or I2C access.
+  try:
+    with open('/sys/firmware/devicetree/base/model') as f:
+      model = f.read().strip('\0').lower()
+  except OSError:
+    model = ''
+  if 'dipper' in model or 'xiaomi' in model:
+    from openpilot.system.sensord.sensord_qmi import main as sensord_qmi_main
+    sensord_qmi_main()
+    return
+
   sensors_cfg = [
     (LSM6DS3_Accel(I2C_BUS_IMU), "accelerometer", True),
     (LSM6DS3_Gyro(I2C_BUS_IMU), "gyroscope", True),

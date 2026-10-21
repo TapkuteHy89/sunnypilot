@@ -42,10 +42,46 @@ struct can_frame {
   long src;
 };
 
+// Black Panda F4 firmware v1.7.3 predates the versioned health and variable
+// length CAN wire formats used by current pandad.
+struct __attribute__((packed)) legacy_f4_health_t {
+  uint32_t uptime_pkt;
+  uint32_t voltage_pkt;
+  uint32_t current_pkt;
+  uint32_t can_rx_errs_pkt;
+  uint32_t can_send_errs_pkt;
+  uint32_t can_fwd_errs_pkt;
+  uint32_t gmlan_send_errs_pkt;
+  uint32_t faults_pkt;
+  uint8_t ignition_line_pkt;
+  uint8_t ignition_can_pkt;
+  uint8_t controls_allowed_pkt;
+  uint8_t gas_interceptor_detected_pkt;
+  uint8_t car_harness_status_pkt;
+  uint8_t usb_power_mode_pkt;
+  uint8_t safety_mode_pkt;
+  uint8_t fault_status_pkt;
+  uint8_t power_save_enabled_pkt;
+};
+
+struct __attribute__((packed)) legacy_f4_can_packet {
+  uint32_t rir;
+  uint32_t rdtr;
+  uint32_t rdlr;
+  uint32_t rdhr;
+};
+
+static_assert(sizeof(legacy_f4_health_t) == 41U);
+static_assert(sizeof(legacy_f4_can_packet) == 16U);
+
 
 class Panda {
 private:
-  std::unique_ptr<PandaSpiHandle> handle;
+  std::unique_ptr<PandaCommsHandle> handle;
+  uint16_t safety_param_cache = 0U;
+  uint16_t alternative_experience_cache = 0U;
+
+  bool uses_legacy_f4_protocol() const;
 
 public:
   Panda(std::string serial);
@@ -94,5 +130,6 @@ protected:
   void pack_can_buffer(const capnp::List<cereal::CanData>::Reader &can_data_list,
                          std::function<void(uint8_t *, size_t)> write_func);
   bool unpack_can_buffer(uint8_t *data, uint32_t &size, std::vector<can_frame> &out_vec);
+  bool unpack_legacy_f4_can_buffer(uint8_t *data, uint32_t &size, std::vector<can_frame> &out_vec);
   uint8_t calculate_checksum(uint8_t *data, uint32_t len);
 };

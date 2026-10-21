@@ -105,16 +105,23 @@ class ModularAssistiveDrivingSystem:
     self.events.remove(old_event)
     self.events_sp.add(new_event)
 
-  def data_sample(self):
+  def data_sample(self, CS: structs.CarState = None):
     # When the safety and selfdrived do not agree on controls_allowed_lateral
     # we want to disengage sunnypilot. However the status from the panda goes through
     # another socket other than the CAN messages and one can arrive earlier than the other.
-    # Therefore we allow a mismatch for two samples, then we trigger the disengagement.
-    if not self.active or self.selfdrive.enabled:
+    # Therefore we allow roughly two seconds of consecutive mismatch before
+    # triggering the disengagement. A matching sample starts a fresh window.
+    # BAIC safety deliberately withholds lateralControlsAllowed below the
+    # 1 km/h steering floor. An armed LKA session at a standstill is therefore
+    # not a controls mismatch; start monitoring once the car can actuate.
+    below_lateral_speed = CS is not None and self.CP.brand == "baic" and CS.vEgo < self.CP.minSteerSpeed
+    if not self.active or self.selfdrive.enabled or below_lateral_speed:
       self.lateral_mismatch_counter = 0
     elif any(not ps.controlsAllowedLateral for ps in self.selfdrive.sm['pandaStates']
              if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.lateral_mismatch_counter += 1
+    else:
+      self.lateral_mismatch_counter = 0
 
   def update_events(self, CS: structs.CarState):
     if not self.selfdrive.enabled and self.enabled:
@@ -164,14 +171,19 @@ class ModularAssistiveDrivingSystem:
         self.events.remove(EventName.buttonEnable)
     else:
       if self.main_enabled_toggle:
-        if CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
+        # BAIC uses cruise availability for the first ACC stage (OEM
+        # longitudinal only). Do not arm MADS from that edge; pcmEnable on the
+        # active ACC stage owns the combined longitudinal+lateral engagement.
+        if self.CP.brand != "baic" and CS.cruiseState.available and not self.selfdrive.CS_prev.cruiseState.available:
           self.events_sp.add(EventNameSP.lkasEnable)
 
     for be in CS.buttonEvents:
       if be.type == ButtonType.cancel:
         if not self.selfdrive.enabled and self.selfdrive.enabled_prev:
           self.events_sp.add(EventNameSP.manualLongitudinalRequired)
-      if be.type == ButtonType.lkas and be.pressed and (CS.cruiseState.available or self.allow_always):
+      # The BAIC X7 LKA switch belongs exclusively to the stock MPC2. It must
+      # never toggle MADS or openpilot lateral control.
+      if be.type == ButtonType.lkas and self.CP.brand != "baic" and be.pressed and (CS.cruiseState.available or self.allow_always):
         if self.enabled:
           if self.selfdrive.enabled:
             self.events_sp.add(EventNameSP.manualSteeringRequired)
@@ -180,6 +192,9 @@ class ModularAssistiveDrivingSystem:
         else:
           self.events_sp.add(EventNameSP.lkasEnable)
 
+    # Brake disengages ACC while cruise main remains available. MADS owns
+    # lateral through that transition according to steering_mode_on_brake;
+    # switching cruise main off still ends the lateral session.
     if not CS.cruiseState.available and not self.no_main_cruise:
       self.events.remove(EventName.buttonEnable)
       if self.selfdrive.CS_prev.cruiseState.available:
@@ -211,7 +226,7 @@ class ModularAssistiveDrivingSystem:
     if not self.enabled_toggle:
       return
 
-    self.data_sample()
+    self.data_sample(CS)
 
     self.update_events(CS)
 

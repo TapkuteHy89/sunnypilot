@@ -6,6 +6,9 @@
 #include <iostream>
 #include <sstream>
 #include <random>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "common/params.h"
 #include "common/swaglog.h"
@@ -169,16 +172,39 @@ LoggerState::LoggerState(const std::string &log_root) {
 }
 
 LoggerState::~LoggerState() {
+  close();
+}
+
+static void sync_directory(const std::string &path) {
+  int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY);
+  assert(fd >= 0);
+  int ret;
+  do {
+    ret = fsync(fd);
+  } while (ret == -1 && errno == EINTR);
+  assert(ret == 0);
+  ::close(fd);
+}
+
+void LoggerState::close() {
   if (rlog) {
     log_sentinel(this, SentinelType::END_OF_ROUTE, exit_signal);
+    rlog.reset();
+    qlog.reset();
     std::remove(lock_file.c_str());
+    sync_directory(segment_path);
   }
 }
 
 bool LoggerState::next() {
   if (rlog) {
     log_sentinel(this, SentinelType::END_OF_SEGMENT);
+    // Finalize and synchronize both streams before making the segment
+    // available to readers/uploader by removing its lock.
+    rlog.reset();
+    qlog.reset();
     std::remove(lock_file.c_str());
+    sync_directory(segment_path);
   }
 
   segment_path = route_path + "--" + std::to_string(++part);
@@ -188,12 +214,25 @@ bool LoggerState::next() {
   lock_file = segment_path + "/rlog.lock";
   std::ofstream{lock_file};
 
-  rlog.reset(new ZstdFileWriter(segment_path + "/rlog.zst", LOG_COMPRESSION_LEVEL));
-  qlog.reset(new ZstdFileWriter(segment_path + "/qlog.zst", LOG_COMPRESSION_LEVEL));
+  rlog.reset(new ZstdFileWriter(segment_path + "/rlog.zst.tmp", LOG_COMPRESSION_LEVEL));
+  qlog.reset(new ZstdFileWriter(segment_path + "/qlog.zst.tmp", LOG_COMPRESSION_LEVEL));
 
   // log init data & sentinel type.
   write(init_data.asBytes(), true);
   log_sentinel(this, part > 0 ? SentinelType::START_OF_SEGMENT : SentinelType::START_OF_ROUTE);
+  // Commit the segment header as a complete zstd frame immediately. Android
+  // can stop loggerd shortly after a timeout rotation, before the normal input
+  // cache fills; without this flush the newly-created rlog/qlog remain zero
+  // bytes and are not valid zstd streams.
+  rlog->flush();
+  qlog->flush();
+  // Publish only initialized, durable logs. A kill during initialization
+  // leaves temporary files rather than zero-byte rlog/qlog.zst files.
+  int ret_r = std::rename((segment_path + "/rlog.zst.tmp").c_str(), (segment_path + "/rlog.zst").c_str());
+  int ret_q = std::rename((segment_path + "/qlog.zst.tmp").c_str(), (segment_path + "/qlog.zst").c_str());
+  assert(ret_r == 0 && ret_q == 0);
+  sync_directory(segment_path);
+  sync_directory(segment_path.substr(0, segment_path.find_last_of('/')));
   return true;
 }
 

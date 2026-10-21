@@ -23,7 +23,7 @@ class LongitudinalPlannerSP:
   def __init__(self, CP: structs.CarParams, CP_SP: structs.CarParamsSP, mpc):
     self.events_sp = EventsSP()
     self.resolver = SpeedLimitResolver()
-    self.scc = SmartCruiseControl()
+    self.scc = SmartCruiseControl(CP.brand)
     self.resolver = SpeedLimitResolver()
     self.sla = SpeedLimitAssist(CP, CP_SP)
     self.generation = int(model_bundle.generation) if (model_bundle := get_active_bundle()) else None
@@ -38,7 +38,9 @@ class LongitudinalPlannerSP:
     v_cruise_cluster_kph = min(CS.vCruiseCluster, V_CRUISE_MAX)
     v_cruise_cluster = v_cruise_cluster_kph * CV.KPH_TO_MS
 
-    long_enabled = sm['carControl'].enabled
+    # MADS may retain lateral control after brake cancels longitudinal. Curve
+    # and speed-limit helpers must follow actual longitudinal authority.
+    long_enabled = sm['carControl'].longActive
     long_override = sm['carControl'].cruiseControl.override
 
     # Smart Cruise Control
@@ -58,6 +60,16 @@ class LongitudinalPlannerSP:
       LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
       LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),
     }
+
+    # NaviPilot/Carrot publishes its selected turn, camera, bump, and Google
+    # route speed in km/h. Only accept a live, valid, positive command and cap
+    # it at the driver's cruise setpoint. The acceleration seed remains the
+    # current measured value; the current longitudinal planner supplies the
+    # jerk-limited transition instead of reviving the legacy Carrot MPC fork.
+    if sm.alive['carrotMan'] and sm.valid['carrotMan']:
+      carrot_v_target = sm['carrotMan'].desiredSpeed * CV.KPH_TO_MS
+      if 0. < carrot_v_target < v_cruise:
+        targets[LongitudinalPlanSource.carrot] = (carrot_v_target, a_ego)
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]

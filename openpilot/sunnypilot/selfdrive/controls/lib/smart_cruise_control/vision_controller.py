@@ -12,7 +12,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.car.cruise import V_CRUISE_UNSET
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
-from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import MIN_V
+from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control import BAIC_TARGET_LAT_ACCEL, MIN_V
 
 VisionState = custom.LongitudinalPlanSP.SmartCruiseControl.VisionState
 
@@ -43,6 +43,20 @@ _TURNING_ACC_BP = [1.5, 2.3, 3.]  # absolute value of current lat acc
 
 _LEAVING_ACC = 0.5  # Conformable acceleration to regain speed while leaving a turn.
 
+# Keep the BAIC X7's early curve detection while using the requested lateral
+# acceleration as its curve-speed target. OSM MapTargetLatA is deployed from
+# the same BAIC_TARGET_LAT_ACCEL value.
+_BAIC_ENTERING_PRED_LAT_ACC_TH = 0.75
+_BAIC_ABORT_ENTERING_PRED_LAT_ACC_TH = 0.60
+_BAIC_TURNING_LAT_ACC_TH = 0.90
+_BAIC_LEAVING_LAT_ACC_TH = 0.75
+_BAIC_FINISH_LAT_ACC_TH = 0.60
+_BAIC_A_LAT_REG_MAX = BAIC_TARGET_LAT_ACCEL
+_BAIC_ENTERING_SMOOTH_DECEL_BP = [0.75, 1.8]
+_BAIC_ENTERING_SMOOTH_DECEL_V = [-0.10, -0.5]
+_BAIC_TURNING_ACC_BP = [0.8, 1.3, 1.8]
+_BAIC_TURNING_ACC_V = [0.3, 0.0, -0.3]
+
 
 class SmartCruiseControlVision:
   v_target: float = 0
@@ -52,7 +66,7 @@ class SmartCruiseControlVision:
   output_v_target: float = V_CRUISE_UNSET
   output_a_target: float = 0.
 
-  def __init__(self):
+  def __init__(self, vehicle_brand: str = ""):
     self.params = Params()
     self.frame = -1
     self.long_enabled = False
@@ -65,6 +79,18 @@ class SmartCruiseControlVision:
     self.state = VisionState.disabled
     self.current_lat_acc = 0.
     self.max_pred_lat_acc = 0.
+
+    is_baic = vehicle_brand == "baic"
+    self.entering_pred_lat_acc_th = _BAIC_ENTERING_PRED_LAT_ACC_TH if is_baic else _ENTERING_PRED_LAT_ACC_TH
+    self.abort_entering_pred_lat_acc_th = _BAIC_ABORT_ENTERING_PRED_LAT_ACC_TH if is_baic else _ABORT_ENTERING_PRED_LAT_ACC_TH
+    self.turning_lat_acc_th = _BAIC_TURNING_LAT_ACC_TH if is_baic else _TURNING_LAT_ACC_TH
+    self.leaving_lat_acc_th = _BAIC_LEAVING_LAT_ACC_TH if is_baic else _LEAVING_LAT_ACC_TH
+    self.finish_lat_acc_th = _BAIC_FINISH_LAT_ACC_TH if is_baic else _FINISH_LAT_ACC_TH
+    self.target_lat_acc = _BAIC_A_LAT_REG_MAX if is_baic else _A_LAT_REG_MAX
+    self.entering_decel_bp = _BAIC_ENTERING_SMOOTH_DECEL_BP if is_baic else _ENTERING_SMOOTH_DECEL_BP
+    self.entering_decel_v = _BAIC_ENTERING_SMOOTH_DECEL_V if is_baic else _ENTERING_SMOOTH_DECEL_V
+    self.turning_acc_bp = _BAIC_TURNING_ACC_BP if is_baic else _TURNING_ACC_BP
+    self.turning_acc_v = _BAIC_TURNING_ACC_V if is_baic else _TURNING_ACC_V
 
   def get_a_target_from_control(self) -> float:
     return self.a_target
@@ -90,14 +116,15 @@ class SmartCruiseControlVision:
 
       # get the maximum lat accel from the model
       predicted_lat_accels = rate_plan * vel_plan
-      self.max_pred_lat_acc = np.percentile(predicted_lat_accels, 97)
+      finite_lat_accels = predicted_lat_accels[np.isfinite(predicted_lat_accels)]
+      self.max_pred_lat_acc = float(np.percentile(finite_lat_accels, 97)) if finite_lat_accels.size else 0.0
 
       # get the maximum curve based on the current velocity
       v_ego = max(self.v_ego, 0.1)  # ensure a value greater than 0 for calculations
       max_curve = self.max_pred_lat_acc / (v_ego**2)
 
       # Get the target velocity for the maximum curve
-      self.v_target = (_A_LAT_REG_MAX / max_curve) ** 0.5
+      self.v_target = (self.target_lat_acc / max_curve) ** 0.5 if max_curve > 1e-6 else V_CRUISE_UNSET
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, ENTERING, TURNING, LEAVING, OVERRIDING
@@ -115,7 +142,7 @@ class SmartCruiseControlVision:
           if self.v_ego <= MIN_V:
             pass
           # If significant lateral acceleration is predicted ahead, then move to Entering turn state.
-          elif self.max_pred_lat_acc >= _ENTERING_PRED_LAT_ACC_TH:
+          elif self.max_pred_lat_acc >= self.entering_pred_lat_acc_th:
             self.state = VisionState.entering
 
         # OVERRIDING
@@ -126,25 +153,25 @@ class SmartCruiseControlVision:
         # ENTERING
         elif self.state == VisionState.entering:
           # Transition to Turning if current lateral acceleration is over the threshold.
-          if self.current_lat_acc >= _TURNING_LAT_ACC_TH:
+          if self.current_lat_acc >= self.turning_lat_acc_th:
             self.state = VisionState.turning
           # Abort if the predicted lateral acceleration drops
-          elif self.max_pred_lat_acc < _ABORT_ENTERING_PRED_LAT_ACC_TH:
+          elif self.max_pred_lat_acc < self.abort_entering_pred_lat_acc_th:
             self.state = VisionState.enabled
 
         # TURNING
         elif self.state == VisionState.turning:
           # Transition to Leaving if current lateral acceleration drops below a threshold.
-          if self.current_lat_acc <= _LEAVING_LAT_ACC_TH:
+          if self.current_lat_acc <= self.leaving_lat_acc_th:
             self.state = VisionState.leaving
 
         # LEAVING
         elif self.state == VisionState.leaving:
           # Transition back to Turning if current lateral acceleration goes back over the threshold.
-          if self.current_lat_acc >= _TURNING_LAT_ACC_TH:
+          if self.current_lat_acc >= self.turning_lat_acc_th:
             self.state = VisionState.turning
           # Finish if current lateral acceleration goes below a threshold.
-          elif self.current_lat_acc < _FINISH_LAT_ACC_TH:
+          elif self.current_lat_acc < self.finish_lat_acc_th:
             self.state = VisionState.enabled
 
     # DISABLED
@@ -169,11 +196,11 @@ class SmartCruiseControlVision:
     # ENTERING
     elif self.state == VisionState.entering:
       # when not overshooting, target a smooth deceleration in preparation for a sharp turn to come.
-      a_target = np.interp(self.max_pred_lat_acc, _ENTERING_SMOOTH_DECEL_BP, _ENTERING_SMOOTH_DECEL_V)
+      a_target = np.interp(self.max_pred_lat_acc, self.entering_decel_bp, self.entering_decel_v)
     # TURNING
     elif self.state == VisionState.turning:
       # When turning, we provide a target acceleration that is comfortable for the lateral acceleration felt.
-      a_target = np.interp(self.current_lat_acc, _TURNING_ACC_BP, _TURNING_ACC_V)
+      a_target = np.interp(self.current_lat_acc, self.turning_acc_bp, self.turning_acc_v)
     # LEAVING
     elif self.state == VisionState.leaving:
       # When leaving, we provide a comfortable acceleration to regain speed.

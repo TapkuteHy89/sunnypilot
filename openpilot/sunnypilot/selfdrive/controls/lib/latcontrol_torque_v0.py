@@ -9,6 +9,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
 from openpilot.common.pid import PIDController
 
+from openpilot.sunnypilot.selfdrive.controls.lib.baic_torque import lateral_error_scale
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext import LatControlTorqueExt
 
 # At higher speeds (25+mph) we can assume:
@@ -47,6 +48,7 @@ class LatControlTorque(LatControl):
     self.lat_accel_request_buffer = deque([0.] * self.lat_accel_request_buffer_len , maxlen=self.lat_accel_request_buffer_len)
     self.previous_measurement = 0.0
     self.measurement_rate_filter = FirstOrderFilter(0.0, 1 / (2 * np.pi * LP_FILTER_CUTOFF_HZ), self.dt)
+    self.is_baic_x7 = CP.carFingerprint == "BEIJING_X7_2022"
 
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
@@ -100,7 +102,8 @@ class LatControlTorque(LatControl):
       ff += get_friction(error, lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
       freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
-      output_lataccel = self.pid.update(pid_log.error,
+      control_error = pid_log.error * lateral_error_scale(self.is_baic_x7, setpoint, measurement)
+      output_lataccel = self.pid.update(control_error,
                                        -measurement_rate,
                                         feedforward=ff,
                                         speed=CS.vEgo,

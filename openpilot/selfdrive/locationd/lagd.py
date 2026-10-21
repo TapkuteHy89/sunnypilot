@@ -23,6 +23,7 @@ MOVING_WINDOW_SEC = 60.0
 MIN_OKAY_WINDOW_SEC = 25.0
 MIN_RECOVERY_BUFFER_SEC = 2.0
 MIN_VEGO = 50.0 * CV.MPH_TO_MS
+BAIC_MIN_VEGO = 25.0 * CV.KPH_TO_MS
 MIN_ABS_YAW_RATE = 0.0
 MAX_YAW_RATE_SANITY_CHECK = 1.0
 MIN_NCC = 0.95
@@ -177,7 +178,7 @@ class LateralLagEstimator:
   def __init__(self, CP: car.CarParams, dt: float,
                block_count: int = BLOCK_NUM, min_valid_block_count: int = BLOCK_NUM_NEEDED, block_size: int = BLOCK_SIZE,
                window_sec: float = MOVING_WINDOW_SEC, okay_window_sec: float = MIN_OKAY_WINDOW_SEC, min_recovery_buffer_sec: float = MIN_RECOVERY_BUFFER_SEC,
-               min_vego: float = MIN_VEGO, min_yr: float = MIN_ABS_YAW_RATE, min_ncc: float = MIN_NCC,
+               min_vego: float | None = None, min_yr: float = MIN_ABS_YAW_RATE, min_ncc: float = MIN_NCC,
                max_lat_accel: float = MAX_LAT_ACCEL, max_lat_accel_diff: float = MAX_LAT_ACCEL_DIFF, min_confidence: float = MIN_CONFIDENCE):
     self.dt = dt
     self.window_sec = window_sec
@@ -187,7 +188,11 @@ class LateralLagEstimator:
     self.block_size = block_size
     self.block_count = block_count
     self.min_valid_block_count = min_valid_block_count
-    self.min_vego = min_vego
+    # The upstream 50 mph gate cannot collect a single sample on the BAIC X7
+    # routes, which are primarily urban and top out well below that speed.
+    # Keep the high-speed default for all existing ports and use a per-brand
+    # floor that still provides enough excitation for the BAIC torque system.
+    self.min_vego = BAIC_MIN_VEGO if min_vego is None and CP.brand == "baic" else (MIN_VEGO if min_vego is None else min_vego)
     self.min_yr = min_yr
     self.min_ncc = min_ncc
     self.min_confidence = min_confidence

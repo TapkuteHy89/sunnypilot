@@ -36,6 +36,7 @@ class SpeedLimitResolver:
   def __init__(self):
     self.params = Params()
     self.frame = -1
+    self.vietmap_exclusive = self.params.get("OsmLocationName") == "VN"
 
     self._gps_location_service = get_gps_location_service(self.params)
     self.limit_solutions = {}  # Store for speed limit solutions from different sources
@@ -95,6 +96,7 @@ class SpeedLimitResolver:
       self.is_metric = self.params.get_bool("IsMetric")
       self.offset_type = self.params.get("SpeedLimitOffsetType", return_default=True)
       self.offset_value = self.params.get("SpeedLimitValueOffset", return_default=True)
+      self.vietmap_exclusive = self.params.get("OsmLocationName") == "VN"
 
   def _get_speed_limit_offset(self) -> float:
     if self.offset_type == OffsetType.off:
@@ -120,6 +122,16 @@ class SpeedLimitResolver:
     self._process_map_data(sm)
 
   def _process_map_data(self, sm: messaging.SubMaster) -> None:
+    # On the Vietnam deployment VietMap Live is the sole road-limit authority.
+    # OSM remains independent and available for SCC-M curve geometry.
+    if self.vietmap_exclusive:
+      if not sm.alive.get('carrotMan', False) or not sm.valid.get('carrotMan', False):
+        return
+      speed_limit = sm['carrotMan'].nRoadLimitSpeed * CV.KPH_TO_MS
+      self.limit_solutions[SpeedLimitSource.map] = speed_limit if speed_limit > 0. else 0.
+      self.distance_solutions[SpeedLimitSource.map] = 0.
+      return
+
     gps_data = sm[self._gps_location_service]
     map_data = sm['liveMapDataSP']
 

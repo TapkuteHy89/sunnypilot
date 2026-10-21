@@ -38,6 +38,13 @@ const float  GPS_POS_STD_RESET_THRESHOLD = 2.0;
 const float  GPS_VEL_STD_RESET_THRESHOLD = 0.5;
 const float  GPS_ORIENTATION_ERROR_RESET_THRESHOLD = 1.0;
 const int    GPS_ORIENTATION_ERROR_RESET_CNT = 3;
+// Debounce transient Broadcom course errors across ten consecutive fixes.
+const int    GPS_BROADCOM_ORIENTATION_ERROR_RESET_CNT = 10;
+const int    GPS_POSITION_ERROR_RESET_CNT = 3;
+const int    GPS_MIN_RESET_SATELLITES = 4;
+const float  GPS_MAX_RESET_HORIZONTAL_ACCURACY = 50.0;
+const float  GPS_MAX_RESET_SPEED_ACCURACY = 2.0;
+const float  GPS_MAX_RESET_BEARING_ACCURACY = 15.0;
 
 const bool   DEBUG = getenv("DEBUG") != nullptr && std::string(getenv("DEBUG")) != "0";
 
@@ -314,6 +321,8 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
   bool gps_vel_insane = (floatlist2vector(log.getVNED()).norm() > TRANS_SANITY_CHECK);
 
   if (!log.getHasFix() || gps_unreasonable || gps_accuracy_insane || gps_lat_lng_alt_insane || gps_vel_insane) {
+    this->orientation_reset_count = 0;
+    this->position_reset_count = 0;
     //this->gps_valid = false;
     this->determine_gps_mode(current_time);
     return;
@@ -349,13 +358,46 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
   }
   VectorXd initial_pose_ecef_quat = quat2vector(euler2quat(ecef_euler_from_ned({ ecef_pos(0), ecef_pos(1), ecef_pos(2) }, orientation_ned_gps)));
 
-  if (ecef_vel.norm() > 5.0 && orientation_error.norm() > 1.0) {
-    LOGE("Locationd vs ubloxLocation orientation difference too large, kalman reset");
+  const bool first_gps = this->last_gps_msg == 0;
+  const int orientation_reset_limit = this->gnss_source == LocalizerGnssSource::BROADCOM ?
+    GPS_BROADCOM_ORIENTATION_ERROR_RESET_CNT : GPS_ORIENTATION_ERROR_RESET_CNT + 1;
+  // A gap breaks a consecutive run of bad course/position observations.
+  if (sensor_time - this->last_gps_msg > 1.0) {
+    this->orientation_reset_count = 0;
+    this->position_reset_count = 0;
+  }
+  const bool reset_quality_ok = log.getSatelliteCount() >= GPS_MIN_RESET_SATELLITES &&
+                                log.getHorizontalAccuracy() <= GPS_MAX_RESET_HORIZONTAL_ACCURACY &&
+                                log.getSpeedAccuracy() <= GPS_MAX_RESET_SPEED_ACCURACY &&
+                                log.getBearingAccuracyDeg() <= GPS_MAX_RESET_BEARING_ACCURACY;
+  const bool orientation_error_large = ecef_vel.norm() > 5.0 && std::abs(orientation_error(2)) > GPS_ORIENTATION_ERROR_RESET_THRESHOLD;
+  const double position_reset_threshold = std::max(100.0, 10.0 * static_cast<double>(log.getHorizontalAccuracy()));
+  const bool position_error_large = gps_est_error > position_reset_threshold;
+
+  this->orientation_reset_count = reset_quality_ok && orientation_error_large ? this->orientation_reset_count + 1 : 0;
+  this->position_reset_count = reset_quality_ok && position_error_large ? this->position_reset_count + 1 : 0;
+
+  if (first_gps) {
+    // A first position fix is filter initialization, not a GPS discontinuity.
+    // At standstill, preserve the current orientation until GNSS course is
+    // observable rather than forcing an arbitrary bearing of zero degrees.
+    VectorXd initialization_orientation = ecef_vel.norm() > 5.0 ? initial_pose_ecef_quat :
+      this->kf->get_x().segment<STATE_ECEF_ORIENTATION_LEN>(STATE_ECEF_ORIENTATION_START);
+    LOGD("Initializing locationd from first GPS position fix");
+    this->reset_kalman(NAN, initialization_orientation, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
+    this->orientation_reset_count = 0;
+    this->position_reset_count = 0;
+  } else if (this->orientation_reset_count >= orientation_reset_limit) {
+    LOGE("Locationd vs GPS orientation difference too large, kalman reset");
     this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
     this->kf->predict_and_observe(sensor_time, OBSERVATION_ECEF_ORIENTATION_FROM_GPS, { initial_pose_ecef_quat });
-  } else if (gps_est_error > 100.0) {
-    LOGE("Locationd vs ubloxLocation position difference too large, kalman reset");
+    this->orientation_reset_count = 0;
+    this->position_reset_count = 0;
+  } else if (this->position_reset_count >= GPS_POSITION_ERROR_RESET_CNT) {
+    LOGE("Locationd vs GPS position difference too large, kalman reset");
     this->reset_kalman(NAN, initial_pose_ecef_quat, ecef_pos, ecef_vel, ecef_pos_R, ecef_vel_R);
+    this->orientation_reset_count = 0;
+    this->position_reset_count = 0;
   }
 
   this->last_gps_msg = sensor_time;
@@ -366,6 +408,7 @@ void Localizer::handle_gps(double current_time, const cereal::GpsLocationData::R
 void Localizer::handle_gnss(double current_time, const cereal::GnssMeasurements::Reader& log) {
 
   if (!log.getPositionECEF().getValid() || !log.getVelocityECEF().getValid()) {
+    this->orientation_reset_count = 0;
     this->determine_gps_mode(current_time);
     return;
   }
@@ -520,7 +563,7 @@ void Localizer::reset_kalman(double current_time) {
 }
 
 void Localizer::finite_check(double current_time) {
-  bool all_finite = this->kf->get_x().array().isFinite().all() or this->kf->get_P().array().isFinite().all();
+  bool all_finite = this->kf->get_x().array().isFinite().all() && this->kf->get_P().array().isFinite().all();
   if (!all_finite) {
     LOGE("Non-finite values detected, kalman reset");
     this->reset_kalman(current_time);
@@ -597,7 +640,7 @@ void Localizer::handle_msg(const cereal::Event::Reader& log) {
   } else if (log.isGpsLocation()) {
     this->handle_gps(t, log.getGpsLocation(), GPS_QUECTEL_SENSOR_TIME_OFFSET);
   } else if (log.isGpsLocationExternal()) {
-    this->handle_gps(t, log.getGpsLocationExternal(), GPS_UBLOX_SENSOR_TIME_OFFSET);
+    this->handle_gps(t, log.getGpsLocationExternal(), this->gps_time_offset);
   //} else if (log.isGnssMeasurements()) {
   //  this->handle_gnss(t, log.getGnssMeasurements());
   } else if (log.isCarState()) {
@@ -667,6 +710,14 @@ void Localizer::configure_gnss_source(const LocalizerGnssSource &source) {
     this->gps_variance_factor = 1.0;
     this->gps_vertical_variance_factor = 1.0;
     this->gps_time_offset = GPS_UBLOX_SENSOR_TIME_OFFSET;
+  } else if (source == LocalizerGnssSource::BROADCOM) {
+    // BCM47755 publishes already-derived NMEA accuracy. The UBLOX multiplier
+    // of 10 makes a 5 m Mi 8 fix look like a 50+ m observation and lets the
+    // inertial solution drift hundreds of metres between corrections.
+    this->gps_std_factor = 1.0;
+    this->gps_variance_factor = 1.0;
+    this->gps_vertical_variance_factor = 0.25;
+    this->gps_time_offset = GPS_UBLOX_SENSOR_TIME_OFFSET;
   } else {
     this->gps_std_factor = 2.0;
     this->gps_variance_factor = 0.0;
@@ -679,7 +730,10 @@ int Localizer::locationd_thread() {
   Params params;
   LocalizerGnssSource source;
   const char* gps_location_socket;
-  if (params.getBool("UbloxAvailable")) {
+  if (util::file_exists("/persist/comma/use-broadcom-gps")) {
+    source = LocalizerGnssSource::BROADCOM;
+    gps_location_socket = "gpsLocationExternal";
+  } else if (params.getBool("UbloxAvailable")) {
     source = LocalizerGnssSource::UBLOX;
     gps_location_socket = "gpsLocationExternal";
   } else {
@@ -742,9 +796,11 @@ int Localizer::locationd_thread() {
   return 0;
 }
 
+#ifndef LOCATIOND_TEST
 int main() {
   util::set_realtime_priority(5);
 
   Localizer localizer;
   return localizer.locationd_thread();
 }
+#endif

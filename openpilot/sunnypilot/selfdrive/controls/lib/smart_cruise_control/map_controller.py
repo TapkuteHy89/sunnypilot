@@ -38,7 +38,13 @@ def velocities_from_param(param: str, params: Params):
   if json_str is None:
     return None
 
-  velocities = json.loads(json_str)
+  try:
+    velocities = json.loads(json_str)
+  except (json.JSONDecodeError, TypeError):
+    return None
+
+  if not isinstance(velocities, list):
+    return None
 
   return velocities
 
@@ -139,18 +145,24 @@ class SmartCruiseControlMap:
       target_velocity = forward_points[i]
       tlat = target_velocity["latitude"]
       tlon = target_velocity["longitude"]
-      tv = target_velocity["velocity"]
-      if tv > self.v_ego:
+      tv = float(target_velocity["velocity"])
+      if not math.isfinite(tv) or tv <= 0.0 or tv >= self.v_cruise:
         continue
 
       d = forward_distances[i]
 
-      a_diff = (self.a_ego - TARGET_ACCEL)
-      accel_t = abs(a_diff / TARGET_JERK)
-      min_accel_v = calculate_velocity(accel_t, TARGET_JERK, self.a_ego, self.v_ego)
-
       max_d = 0
-      if tv > min_accel_v:
+      if tv >= self.v_ego:
+        # Keep the curve target while below it until the closest curve point
+        # has passed; otherwise cruise immediately accelerates back to the set
+        # speed in the middle of the turn.
+        max_d = 0.0
+      else:
+        a_diff = (self.a_ego - TARGET_ACCEL)
+        accel_t = abs(a_diff / TARGET_JERK)
+        min_accel_v = calculate_velocity(accel_t, TARGET_JERK, self.a_ego, self.v_ego)
+
+      if tv < self.v_ego and tv > min_accel_v:
         # calculate time needed based on target jerk
         a = 0.5 * TARGET_JERK
         b = self.a_ego
@@ -165,7 +177,7 @@ class SmartCruiseControlMap:
           continue
 
         max_d = max_d + calculate_distance(t, TARGET_JERK, self.a_ego, self.v_ego)
-      else:
+      elif tv < self.v_ego:
         t = accel_t
         max_d = calculate_distance(t, TARGET_JERK, self.a_ego, self.v_ego)
 
@@ -191,9 +203,7 @@ class SmartCruiseControlMap:
         target_velocity = forward_points[i]
         tlat = target_velocity["latitude"]
         tlon = target_velocity["longitude"]
-        tv = target_velocity["velocity"]
-        if tv > self.v_ego:
-          continue
+        tv = float(target_velocity["velocity"])
 
         if tlat == self.target_lat and tlon == self.target_lon and tv == self.v_target:
           return
@@ -206,6 +216,10 @@ class SmartCruiseControlMap:
     self.v_target = min_v
     self.target_lat = target_lat
     self.target_lon = target_lon
+
+    # Distance selection above already solves the jerk-limited braking point.
+    # Publishing another fixed-rate ramp here delays turn-in and duplicates the
+    # longitudinal planner's acceleration/jerk limiting.
 
   def _update_state_machine(self) -> tuple[bool, bool]:
     # ENABLED, TURNING

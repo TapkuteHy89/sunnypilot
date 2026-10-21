@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdio>
+
 #include "cdm.h"
 
 #include "system/camerad/cameras/hw.h"
@@ -38,8 +40,15 @@ int build_common_ife_bps(uint8_t *dst, const CameraConfig cam, const SensorInfo 
   return dst - start;
 }
 
-int build_update(uint8_t *dst, const CameraConfig cam, const SensorInfo *s, std::vector<uint32_t> &patches) {
+int build_update(uint8_t *dst, const CameraConfig cam, const SensorInfo *s, std::vector<uint32_t> &patches, int abf_profile = 0, bool update_abf = false) {
   uint8_t *start = dst;
+  if (update_abf && !s->abf34_noise_lut_profiles.empty()) {
+    uint64_t addr;
+    // ABF34 bank 0 is safe to update per request; the buffer address is
+    // patched by SpectraCamera to the selected factory AEC profile.
+    dst += write_dmi(dst, &addr, 64*sizeof(uint32_t), 0xc24, 12);
+    patches.push_back(addr - (uint64_t)start);
+  }
 
   // init sequence
   dst += write_random(dst, {
@@ -61,17 +70,61 @@ int build_update(uint8_t *dst, const CameraConfig cam, const SensorInfo *s, std:
     0x0000009c,
   });
 
-  // white balance
-  dst += write_cont(dst, 0x6fc, {
-    0x00800080,
-    0x00000080,
-    0x00000000,
-    0x00000000,
-  });
+  // White balance uses one gain file per sensor ("lo hi w1" / G B R, Q7,
+  // 1.0 = neutral).  The IMX363 and S5K3M3 have different CFA/module colour
+  // responses; sharing the IMX363 gains with the tele camera caused the
+  // S5K3M3 image to turn green.
+  // Left neutral the IFE applies no WB at all and the D65 CCM (whose rows sum to ~1.0,
+  // i.e. it expects white-balanced input) turns neutral surfaces magenta.
+  // Re-read periodically so gains can be swept on a live camerad during tuning.
+  {
+    // Camera 0 is the original wide IMX363; camera 1 is the tele S5K3M3.
+    // Keep state and refresh cadence independent so an update for one module
+    // can never leak into the other.  The tele defaults were measured from
+    // the live NV12 output at analog gain 16x using near-neutral pixels.
+    struct WbState {
+      float lo;
+      float hi;
+      float w1;
+      int tick;
+    };
+    static WbState wb[3] = {
+      {1.0f, 1.6610f, 1.7400f, 0},  // IMX363: G B R
+      {1.0f, 1.4370f, 1.9473f, 0},  // S5K3M3 tele: G B R
+      {1.0f, 1.0f,    1.0f,    0},
+    };
+    const int wb_index = (cam.camera_num >= 0 && cam.camera_num < 2) ? cam.camera_num : 2;
+    WbState &state = wb[wb_index];
+    const char *gain_file = (cam.camera_num == 1) ? "/data/tele_wb_gains.txt" : "/data/wb_gains.txt";
+    if ((state.tick++ % 30) == 0) {
+      if (FILE *f = fopen(gain_file, "r")) {
+        float a, b, c;
+        if (fscanf(f, "%f %f %f", &a, &b, &c) == 3 &&
+            a > 0.0f && a < 8.0f && b > 0.0f && b < 8.0f && c > 0.0f && c < 8.0f) {
+          state.lo = a; state.hi = b; state.w1 = c;
+        }
+        fclose(f);
+      }
+    }
+    auto q7 = [](float g) -> uint32_t { return (uint32_t)(g * 128.0f + 0.5f) & 0xFFFF; };
+    dst += write_cont(dst, 0x6fc, {
+      (q7(state.hi) << 16) | q7(state.lo),
+      q7(state.w1),
+      0x00000000,
+      0x00000000,
+    });
+  }
 
   // module config/enables (e.g. enable debayer, white balance, etc.)
   dst += write_cont(dst, 0x40, {
-    0x00000c06 | ((uint32_t)(cam.vignetting_correction) << 8),
+    // Factory CamX IFEABF34 writes lens module bit 7. The base bits are the
+    // already working V4L2 path; ABF34 register/LUT programming is below.
+    // Keep a process-start opt-out for a controlled HAL-vs-V4 sharpness A/B:
+    // clearing the module enable leaves the factory DMI buffers allocated but
+    // prevents the IFE from applying ABF.  It is deliberately off by default;
+    // a noisy unfiltered frame is not a production image-quality fix.
+    (0x00000c86 & (getenv("DISABLE_IFE_ABF") ? ~0x80u : ~0u)) |
+      ((uint32_t)(cam.vignetting_correction) << 8),
   });
   dst += write_cont(dst, 0x44, {
     0x00000000,
@@ -177,9 +230,29 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo 
   });
   dst += write_dmi(dst, &addr, s->gamma_lut_rgb.size()*sizeof(uint32_t), 0xc24, 26);  // G
   patches.push_back(addr - (uint64_t)start);
+
   dst += write_dmi(dst, &addr, s->gamma_lut_rgb.size()*sizeof(uint32_t), 0xc24, 28);  // B
   patches.push_back(addr - (uint64_t)start);
   dst += write_dmi(dst, &addr, s->gamma_lut_rgb.size()*sizeof(uint32_t), 0xc24, 30);  // R
+  patches.push_back(addr - (uint64_t)start);
+
+  // IMX363 factory IFE ABF34 register locations and field layout recovered
+  // from Xiaomi CamX. FILTER_EN is enabled with legal neutral RNR/noise-
+  // preserve fields; the DMI payload comes from the IMX363 Chromatix table.
+  dst += write_cont(dst, 0x5e8, {
+    0x06363349,
+  });
+  dst += write_cont(dst, 0x5f4, {
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x3ffb0000, 0x00000000, 0x08000400, 0x0fff0c00,
+    0x000000ff, 0x000000ff, 0x000000ff, 0x000000ff,
+    0x000000ff, 0x000000ff, 0x000000ff, 0x000000ff,
+    0x00000000,
+    0x00030201, // BPC: fmax=1, fmin=2, offset=3
+    0x000040ee, // BPC: BLS=64, max/min shift=14
+    0x00010000, 0x00000000, 0x00000000,
+  });
+  dst += write_dmi(dst, &addr, 64*sizeof(uint32_t), 0xc24, 12); // ABF34 bank 0
   patches.push_back(addr - (uint64_t)start);
 
   // output size/scaling
@@ -232,5 +305,3 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo 
 
   return dst - start;
 }
-
-

@@ -74,6 +74,32 @@ function launch {
   ln -sfn "$(pwd)" /data/pythonpath
   export PYTHONPATH="$PWD"
 
+  # The Mi 8 image predates the dependency set used by current sunnypilot.
+  # Keep the migrated runtime isolated from the production system venv so a
+  # failed test can be rolled back without leaving mixed Python packages.
+  if [ -f /TICI ] && [ -x "$DIR/.venv/bin/python3" ]; then
+    export VIRTUAL_ENV="$DIR/.venv"
+    export PATH="$VIRTUAL_ENV/bin:$PATH"
+  fi
+
+  # raylib 6's comma backend selects an EGL config that the SDM845/Mi 8
+  # display stack does not expose. The device image ships a comma raylib 5.5
+  # backend which has the same Python API used by the current UI and has been
+  # validated as a magic DRM client on this panel. Prefer only those two
+  # packages on non-comma /TICI compatibility devices; keep every other
+  # dependency in the isolated current-sunnypilot venv.
+  if [ -f /TICI ] && [ -r /proc/device-tree/model ] && \
+     ! grep -aqi 'comma' /proc/device-tree/model && \
+     [ -d /usr/local/venv/lib/python3.12/site-packages/raylib ] && \
+     [ -d /usr/local/venv/lib/python3.12/site-packages/pyray ]; then
+    MI8_RAYLIB_COMPAT=/tmp/mi8-raylib-py
+    rm -rf "$MI8_RAYLIB_COMPAT"
+    mkdir -p "$MI8_RAYLIB_COMPAT"
+    ln -s /usr/local/venv/lib/python3.12/site-packages/raylib "$MI8_RAYLIB_COMPAT/raylib"
+    ln -s /usr/local/venv/lib/python3.12/site-packages/pyray "$MI8_RAYLIB_COMPAT/pyray"
+    export PYTHONPATH="$MI8_RAYLIB_COMPAT:$PYTHONPATH"
+  fi
+
   # submodule package symlinks for PYTHONPATH imports on device.
   # on PC these come from editable installs via pyproject.toml / uv.
   ln -sfn msgq_repo/msgq msgq
@@ -81,9 +107,15 @@ function launch {
   ln -sfn rednose_repo/rednose rednose
   ln -sfn teleoprtc_repo/teleoprtc teleoprtc
   ln -sfn tinygrad_repo/tinygrad tinygrad
+  # Git symlinks are checked out as text files on the Windows migration host.
+  # Restore the generated vehicle catalog link before the Python UI loads it.
+  ln -sfn ../../../../opendbc_repo/opendbc/sunnypilot/car/car_list.json \
+    openpilot/sunnypilot/selfdrive/car/car_list.json
 
   # hardware specific init
-  if [ -f /AGNOS ]; then
+  # The Mi 8 compatibility image exposes both /AGNOS and /TICI markers, but it
+  # is not an AGNOS-updatable comma device. Never enter the slot updater here.
+  if [ -f /AGNOS ] && [ ! -f /TICI ]; then
     agnos_init
   fi
 

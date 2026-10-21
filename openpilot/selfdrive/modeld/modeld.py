@@ -29,6 +29,7 @@ from msgq.visionipc import VisionIpcClient, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
+from openpilot.common.hardware.comma.hardware import is_mi8_hardware
 from openpilot.common.hardware.usb import cable_connected
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
@@ -41,7 +42,9 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob, wait_for_chestnut
+from openpilot.selfdrive.modeld.mi8_camera import select_road_streams, load_mi8_wide_camera_extrinsics
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
+from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
 
@@ -145,7 +148,8 @@ def input_view(buffer: Buffer, shape: tuple[int, ...], dtype: DType, offset: int
 class ModelState(ModelStateBase):
   prev_desire: np.ndarray  # for tracking the rising edge of the pulse
 
-  def __init__(self, cam_w: int, cam_h: int, chestnut: bool):
+  def __init__(self, cam_w: int, cam_h: int, chestnut: bool,
+               extra_cam_w: int | None = None, extra_cam_h: int | None = None):
     ModelStateBase.__init__(self)
     jits = load_oob(modeld_pkl_path(chestnut), chestnut)
     self.model_device = jits['input_specs']['new_img'][2]
@@ -157,12 +161,33 @@ class ModelState(ModelStateBase):
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
     self.chestnut = chestnut
 
-    stride, y_height, uv_height, _ = get_nv12_info(cam_w, cam_h)
-    self.frame_copy_size = stride * (y_height + uv_height)
+    extra_cam_w = cam_w if extra_cam_w is None else extra_cam_w
+    extra_cam_h = cam_h if extra_cam_h is None else extra_cam_h
+    self.camera_sizes = {
+      'img': (cam_w, cam_h),
+      'big_img': (extra_cam_w, extra_cam_h),
+    }
+    self.frame_copy_sizes = {}
+    for name, (width, height) in self.camera_sizes.items():
+      stride, y_height, uv_height, _ = get_nv12_info(width, height)
+      self.frame_copy_sizes[name] = stride * (y_height + uv_height)
+    self.mixed_camera_sizes = self.camera_sizes['img'] != self.camera_sizes['big_img']
+    if self.mixed_camera_sizes and chestnut:
+      raise RuntimeError("mixed-resolution camera preprocessing is not supported on Chestnut")
     self.pack_inputs()
-    with open(MODELS_DIR / f'{"big_" if chestnut else ""}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl', 'rb') as f:
-      self.run_warp = pickle.load(f)['run']
-    self.run_warp.captured._linear = lower_and_compile(self.run_warp.captured._linear)
+    if self.mixed_camera_sizes:
+      self.run_warps = {}
+      for name, (width, height) in self.camera_sizes.items():
+        with open(MODELS_DIR / f'driving_warp_{width}x{height}_single_tinygrad.pkl', 'rb') as f:
+          run_warp = pickle.load(f)['run']
+        run_warp.captured._linear = lower_and_compile(run_warp.captured._linear)
+        self.run_warps[name] = run_warp
+      self.run_warp = None
+    else:
+      with open(MODELS_DIR / f'{"big_" if chestnut else ""}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl', 'rb') as f:
+        self.run_warp = pickle.load(f)['run']
+      self.run_warp.captured._linear = lower_and_compile(self.run_warp.captured._linear)
+      self.run_warps = {}
     self.run_model = jits['run']
     self.run_model.captured._linear = lower_and_compile(self.run_model.captured._linear)
     self.outputs = {name: Tensor(np.zeros(shape, dtype=dtype), device=device).realize() for name, (shape, dtype, device) in jits['output_specs'].items()}
@@ -178,7 +203,8 @@ class ModelState(ModelStateBase):
     shapes = {'tfm': (2, 3, 3)} | {name: shape for name, (shape, _) in self.input_shapes.items()
                                    if name not in self.state_pairs and name != 'new_img'}
     npy_size = sum(round_up(math.prod(shape) * 4, 128) for shape in shapes.values())
-    self.packed_input = np.zeros(npy_size + 2 * self.frame_copy_size, dtype=np.uint8)
+    frame_bytes = sum(self.frame_copy_sizes.values())
+    self.packed_input = np.zeros(npy_size + frame_bytes, dtype=np.uint8)
     self.input_host = Tensor(self.packed_input, device='NPY')._buffer()
     self.input_device = Tensor(self.packed_input, device=self.model_device)._buffer()
     self.npy = {}
@@ -187,8 +213,30 @@ class ModelState(ModelStateBase):
       self.npy[name] = np.ndarray(shape, dtype=np.float32, buffer=self.packed_input, offset=offset)
       self.input_queues[name] = input_view(self.input_device, shape, dtypes.float32, offset)
       offset += round_up(self.npy[name].nbytes, 128)
-    self.frames = self.packed_input[npy_size:].reshape(2, self.frame_copy_size)
-    self.warp_inputs = {'input_frame': input_view(self.input_device, self.frames.shape, dtypes.uint8, npy_size), 'M_inv': self.input_queues.pop('tfm')}
+    self.frames = {}
+    frame_inputs = {}
+    frame_offset = npy_size
+    for name in self.vision_input_names:
+      frame_size = self.frame_copy_sizes[name]
+      self.frames[name] = self.packed_input[frame_offset:frame_offset + frame_size]
+      frame_inputs[name] = input_view(self.input_device, (frame_size,), dtypes.uint8, frame_offset)
+      frame_offset += frame_size
+
+    if self.mixed_camera_sizes:
+      self.input_queues.pop('tfm')
+      tfm_size = 3 * 3 * dtypes.float32.itemsize
+      self.warp_inputs = {
+        name: {
+          'input_frame': frame_inputs[name],
+          'M_inv': input_view(self.input_device, (3, 3), dtypes.float32, i * tfm_size),
+        }
+        for i, name in enumerate(self.vision_input_names)
+      }
+    else:
+      tfm = self.input_queues.pop('tfm')
+      frame_size = self.frame_copy_sizes['img']
+      stacked_frames = input_view(self.input_device, (2, frame_size), dtypes.uint8, npy_size)
+      self.warp_inputs = {'input_frame': stacked_frames, 'M_inv': tfm}
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     return {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
@@ -196,7 +244,8 @@ class ModelState(ModelStateBase):
   def run(self, bufs: dict[str, VisionBuf], transforms: dict[str, np.ndarray],
           inputs: dict[str, np.ndarray], after_enqueue: Callable[[], None] | None = None) -> dict[str, np.ndarray]:
     for i, key in enumerate(self.vision_input_names):
-      np.copyto(self.frames[i], np.frombuffer(bufs[key].data, dtype=np.uint8, count=self.frame_copy_size))
+      frame_size = self.frame_copy_sizes[key]
+      np.copyto(self.frames[key], np.frombuffer(bufs[key].data, dtype=np.uint8, count=frame_size))
       self.npy['tfm'][i] = transforms[key]
 
     # Model decides when action is completed, so desire input is just a pulse triggered on rising edge
@@ -207,7 +256,13 @@ class ModelState(ModelStateBase):
     self.npy['action_t'][:] = inputs['action_t']
 
     self.input_device.copy_from(self.input_host)
-    self.input_queues['new_img'] = self.run_warp(**self.warp_inputs)
+    if self.mixed_camera_sizes:
+      self.input_queues['new_img'] = Tensor.stack(*(
+        self.run_warps[name](**self.warp_inputs[name]) for name in self.vision_input_names
+      ))
+    else:
+      assert self.run_warp is not None
+      self.input_queues['new_img'] = self.run_warp(**self.warp_inputs)
     self.run_model(output_buffers=self.outputs, **self.input_queues)
     if self.chestnut and (err := Device[self.outputs['outputs'].device].error_state.host.view(fmt='q')[0]):
       raise RuntimeError(f"chestnut failed with {err}")
@@ -223,7 +278,7 @@ class ModelState(ModelStateBase):
     return outputs_dict
 
   def warmup(self) -> None:
-    dummy_frames = {k: np.zeros(self.frame_copy_size, dtype=np.uint8) for k in self.vision_input_names}
+    dummy_frames = {k: np.zeros(self.frame_copy_sizes[k], dtype=np.uint8) for k in self.vision_input_names}
     eye = np.eye(3, dtype=np.float32)
     dims = {'desire_pulse': ModelConstants.DESIRE_LEN, 'traffic_convention': 2, 'action_t': 2}
     self.run(dummy_frames, dict.fromkeys(self.vision_input_names, eye), {k: np.zeros(v, dtype=np.float32) for k, v in dims.items()})
@@ -236,7 +291,10 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  CHESTNUT = chestnut_compiled() and (chestnut_present() or cable_connected())
+  # Mi 8's USB-C cable reports connected, but the attached USB device is the
+  # legacy Black Panda rather than a Chestnut accelerator. Never spend the
+  # model startup timeout waiting for hardware that this port does not have.
+  CHESTNUT = not is_mi8_hardware() and chestnut_compiled() and (chestnut_present() or cable_connected())
   if CHESTNUT:
     from tinygrad.runtime.ops_amd import AMDDevice
     AMDDevice.wait_timeout_ms = 3000
@@ -250,12 +308,10 @@ def main(demo=False):
   while True:
     available_streams = VisionIpcClient.available_streams("camerad", block=False)
     if available_streams:
-      use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_NARROW_ROAD in available_streams
-      main_wide_camera = VisionStreamType.VISION_STREAM_NARROW_ROAD not in available_streams
+      vipc_client_main_stream, use_extra_client, main_wide_camera, mi8_dual_camera = select_road_streams(available_streams)
       break
     time.sleep(.1)
 
-  vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_NARROW_ROAD
   vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
   vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
@@ -278,7 +334,9 @@ def main(demo=False):
       nonlocal big_model
       try:
         wait_for_chestnut()
-        m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
+        m = ModelState(vipc_client_main.width, vipc_client_main.height, True,
+                       vipc_client_extra.width if use_extra_client else vipc_client_main.width,
+                       vipc_client_extra.height if use_extra_client else vipc_client_main.height)
         m.warmup()
         big_model = m
       except Exception:
@@ -295,7 +353,9 @@ def main(demo=False):
     else:
       params.put_bool("ChestnutActive", model is not None)
 
-  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
+  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False,
+                           vipc_client_extra.width if use_extra_client else vipc_client_main.width,
+                           vipc_client_extra.height if use_extra_client else vipc_client_main.height) if model is None or CHESTNUT else None
   if model is None:
     model = small_model
   assert model is not None
@@ -308,7 +368,7 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay"])
+                  "carControl", "controlsState", "lateralDelay", "carrotMan"])
 
   publish_state = PublishState()
   params = Params()
@@ -326,6 +386,14 @@ def main(demo=False):
   buf_main, buf_extra = None, None
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
+  camera_offset_helper = CameraOffsetHelper()
+  wide_camera_from_device_euler = load_mi8_wide_camera_extrinsics() if mi8_dual_camera else None
+  startup_sync_drops = 0
+  max_startup_sync_drops = 5
+  if wide_camera_from_device_euler is not None:
+    cloudlog.warning(f"Mi 8 wide-camera extrinsics enabled (degrees): {np.degrees(wide_camera_from_device_euler)}")
+  elif mi8_dual_camera:
+    cloudlog.warning("Mi 8 wide-camera extrinsics are not configured; using the legacy identity transform")
 
   if demo:
     CP = get_demo_car_params()
@@ -365,7 +433,12 @@ def main(demo=False):
         cloudlog.debug("vipc_client_extra no frame")
         continue
 
-      if abs(meta_main.timestamp_sof - meta_extra.timestamp_sof) > 10000000:
+      sync_delta = abs(meta_main.timestamp_sof - meta_extra.timestamp_sof)
+      if mi8_dual_camera and run_count == 0 and sync_delta > 10000000 and startup_sync_drops < max_startup_sync_drops:
+        startup_sync_drops += 1
+        cloudlog.warning(f"discarding unsynchronized startup camera pair {startup_sync_drops}")
+        continue
+      if sync_delta > 10000000:
         cloudlog.error(f"frames out of sync! main: {meta_main.frame_id} ({meta_main.timestamp_sof / 1e9:.5f}),\
                          extra: {meta_extra.frame_id} ({meta_extra.timestamp_sof / 1e9:.5f})")
 
@@ -380,15 +453,26 @@ def main(demo=False):
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
     model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
+    if sm.frame % 60 == 0:
+      camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
     lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
       main_intrinsics = dc.wide_road.intrinsics if main_wide_camera else dc.narrow_road.intrinsics
-      model_transform_main = get_warp_matrix(device_from_calib_euler, main_intrinsics, False).astype(np.float32)
+      model_transform_main = get_warp_matrix(
+        device_from_calib_euler, main_intrinsics, False,
+        wide_camera_from_device_euler if main_wide_camera and mi8_dual_camera else None,
+      ).astype(np.float32)
       has_wide_camera = use_extra_client or main_wide_camera
       extra_intrinsics = dc.wide_road.intrinsics if has_wide_camera else dc.narrow_road.intrinsics
-      model_transform_extra = get_warp_matrix(device_from_calib_euler, extra_intrinsics, True).astype(np.float32)
+      model_transform_extra = get_warp_matrix(
+        device_from_calib_euler, extra_intrinsics, True,
+        wide_camera_from_device_euler if mi8_dual_camera else None,
+      ).astype(np.float32)
+      model_transform_main, model_transform_extra = camera_offset_helper.update(
+        model_transform_main, model_transform_extra, sm, main_wide_camera,
+      )
       extrinsics_calibration_seen = True
 
     traffic_convention = np.zeros(2)
@@ -460,7 +544,9 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)
+      carrot_man = sm['carrotMan'] if sm.alive['carrotMan'] and sm.valid['carrotMan'] else None
+      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, carrot_man=carrot_man,
+                left_edge_detected=left_edge, right_edge_detected=right_edge)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       mdv2sp_send.valid = modelv2_send.valid

@@ -39,7 +39,12 @@ void rotate_if_needed(LoggerdState *s) {
   double seg_length_secs = (tms - s->last_rotate_tms) / 1000.;
   if ((seg_length_secs > SEGMENT_LENGTH) && !LOGGERD_TEST) {
     // TODO: might be nice to put these reasons in the sentinel
-    if ((tms - s->last_camera_seen_tms) > NO_CAMERA_PATIENCE) {
+    if (s->max_waiting == 0 && util::getenv("LOGGERD_NO_ENCODERS") == "1") {
+      // Mi 8 logs raw camera/model services without encoderd. Rotate on the
+      // normal time boundary; absence of encoder packets is expected here.
+      timed_out = true;
+      LOGD("time-based segment rotation without encoders");
+    } else if ((tms - s->last_camera_seen_tms) > NO_CAMERA_PATIENCE) {
       timed_out = true;
       LOGE("no camera packets seen. auto rotating");
     } else if (seg_length_secs > SEGMENT_LENGTH*1.2) {
@@ -331,6 +336,7 @@ void loggerd_thread() {
 
   LOGW("closing logger");
   s.logger.setExitSignal(do_exit.signal);
+  s.logger.close();
 
   if (do_exit.power_failure) {
     LOGE("power failure");

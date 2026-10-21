@@ -19,6 +19,7 @@ from setproctitle import setproctitle
 import openpilot.cereal.messaging as messaging
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.selfdrive.modeld.helpers import chestnut_present, wait_for_chestnut
+from openpilot.selfdrive.modeld.mi8_camera import select_road_streams, load_mi8_wide_camera_extrinsics
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.services import SERVICE_LIST
@@ -274,12 +275,10 @@ def main(demo=False):
   while True:
     available_streams = VisionIpcClient.available_streams("camerad", block=False)
     if available_streams:
-      use_extra_client = VisionStreamType.VISION_STREAM_WIDE_ROAD in available_streams and VisionStreamType.VISION_STREAM_NARROW_ROAD in available_streams
-      main_wide_camera = VisionStreamType.VISION_STREAM_NARROW_ROAD not in available_streams
+      vipc_client_main_stream, use_extra_client, main_wide_camera, mi8_dual_camera = select_road_streams(available_streams)
       break
     time.sleep(.1)
 
-  vipc_client_main_stream = VisionStreamType.VISION_STREAM_WIDE_ROAD if main_wide_camera else VisionStreamType.VISION_STREAM_NARROW_ROAD
   vipc_client_main = VisionIpcClient("camerad", vipc_client_main_stream, True)
   vipc_client_extra = VisionIpcClient("camerad", VisionStreamType.VISION_STREAM_WIDE_ROAD, False)
   cloudlog.warning(f"vision stream set up, main_wide_camera: {main_wide_camera}, use_extra_client: {use_extra_client}")
@@ -333,7 +332,7 @@ def main(demo=False):
   pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutGpuState"] if CHESTNUT else [])
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState",
-                  "carControl", "controlsState", "lateralDelay"])
+                  "carControl", "controlsState", "lateralDelay", "carrotMan"])
 
   publish_state = PublishState()
   chestnut_state = ChestnutGpuState(pm, model.chestnut) if CHESTNUT else None
@@ -351,6 +350,13 @@ def main(demo=False):
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
   camera_offset_helper = CameraOffsetHelper()
+  wide_camera_from_device_euler = load_mi8_wide_camera_extrinsics() if mi8_dual_camera else None
+  startup_sync_drops = 0
+  max_startup_sync_drops = 5
+  if wide_camera_from_device_euler is not None:
+    cloudlog.warning(f"Mi 8 wide-camera extrinsics enabled (degrees): {np.degrees(wide_camera_from_device_euler)}")
+  elif mi8_dual_camera:
+    cloudlog.warning("Mi 8 wide-camera extrinsics are not configured; using the legacy identity transform")
 
 
   if demo:
@@ -391,7 +397,12 @@ def main(demo=False):
         cloudlog.debug("vipc_client_extra no frame")
         continue
 
-      if abs(meta_main.timestamp_sof - meta_extra.timestamp_sof) > 10000000:
+      sync_delta = abs(meta_main.timestamp_sof - meta_extra.timestamp_sof)
+      if mi8_dual_camera and run_count == 0 and sync_delta > 10000000 and startup_sync_drops < max_startup_sync_drops:
+        startup_sync_drops += 1
+        cloudlog.warning(f"discarding unsynchronized startup camera pair {startup_sync_drops}")
+        continue
+      if sync_delta > 10000000:
         cloudlog.error(f"frames out of sync! main: {meta_main.frame_id} ({meta_main.timestamp_sof / 1e9:.5f}),\
                        extra: {meta_extra.frame_id} ({meta_extra.timestamp_sof / 1e9:.5f})")
 
@@ -414,8 +425,14 @@ def main(demo=False):
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
       main_intrinsics = dc.wide_road.intrinsics if main_wide_camera else dc.narrow_road.intrinsics
-      model_transform_main = get_warp_matrix(device_from_calib_euler, main_intrinsics, False).astype(np.float32)
-      model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.wide_road.intrinsics, True).astype(np.float32)
+      model_transform_main = get_warp_matrix(
+        device_from_calib_euler, main_intrinsics, False,
+        wide_camera_from_device_euler if main_wide_camera and mi8_dual_camera else None,
+      ).astype(np.float32)
+      model_transform_extra = get_warp_matrix(
+        device_from_calib_euler, dc.wide_road.intrinsics, True,
+        wide_camera_from_device_euler if mi8_dual_camera else None,
+      ).astype(np.float32)
       model_transform_main, model_transform_extra = camera_offset_helper.update(model_transform_main, model_transform_extra, sm, main_wide_camera)
       live_calib_seen = True
 
@@ -494,7 +511,9 @@ def main(demo=False):
       r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
       lane_change_prob = l_lane_change_prob + r_lane_change_prob
       left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)
+      carrot_man = sm['carrotMan'] if sm.alive['carrotMan'] and sm.valid['carrotMan'] else None
+      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, carrot_man=carrot_man,
+                left_edge_detected=left_edge, right_edge_detected=right_edge)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       mdv2sp_send.valid = modelv2_send.valid

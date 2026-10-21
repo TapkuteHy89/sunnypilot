@@ -1,8 +1,12 @@
 #include "cdm.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <stdint.h>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -274,6 +278,12 @@ int SpectraCamera::clear_req_queue() {
 }
 
 void SpectraCamera::camera_open(VisionIpcServer *v) {
+  // Bail out before touching hardware: openSensor() probes and acquires the sensor, and on
+  // xiaomi8 several configs share camera_num 0 (only ROAD is enabled), so probing for a
+  // disabled camera would re-acquire the sensor ROAD already holds and abort on
+  // assert(sensor_dev_handle_). comma3 hides this because each config has its own sensor.
+  if (!enabled) return;
+
   if (!openSensor()) {
     return;
   }
@@ -295,7 +305,7 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
   linkDevices();
 
   LOGD("camera init %d", cc.camera_num);
-  buf.init(this, v, ife_buf_depth, cc.stream_type);
+  buf.init(nullptr, nullptr, this, v, ife_buf_depth, cc.stream_type);  // 2026-08-30: ISP_IFE_PROCESSED path, no GPU demosaic needed
   camera_map_bufs();
   clearAndRequeue(1);
 }
@@ -308,7 +318,10 @@ void SpectraCamera::sensors_start() {
 
 void SpectraCamera::sensors_poke(int request_id) {
   uint32_t cam_packet_handle = 0;
-  int size = sizeof(struct cam_packet);
+  // The kernel rejects a buffer exactly the size of the packet: cam_sensor_i2c_pkt_parse()
+  // tests `config.offset >= len_of_buff - sizeof(struct cam_packet)`, which is 0 >= 0 for a
+  // 64-byte allocation, so every poke failed with "Failed CCI Config: -22". Pad it out.
+  int size = sizeof(struct cam_packet) + 8;
   auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
   pkt->num_cmd_buf = 0;
   pkt->kmd_cmd_buf_index = -1;
@@ -384,19 +397,64 @@ int SpectraCamera::sensors_init() {
   probe->expected_data = sensor->probe_expected_data;
   probe->data_mask = 0;
 
-  //buf_desc[1].size = buf_desc[1].length = 148;
-  buf_desc[1].size = buf_desc[1].length = 196;
+  // Allocate generously; the exact byte count is computed after the sequence is built
+  // (it used to be hardcoded at 196, which silently encoded the old 4-entry power-up group).
+  buf_desc[1].size = buf_desc[1].length = 256;
   buf_desc[1].type = CAM_CMD_BUF_I2C;
   auto power_settings = m->mem_mgr.alloc<struct cam_cmd_power>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
 
-  // power on
   struct cam_cmd_power *power = power_settings.get();
-  power->count = 4;
+  if (cc.camera_num == 1) {
+    // Xiaomi's stock S5K3M3SN03 sequence, decoded from the vendor sensor bin:
+    // VANA -> VIO -> VDIG, RESET high, then 24 MHz MCLK. Unlike IMX363 this
+    // module has no CUSTOM_GPIO1 rail.
+    power->count = 3;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 1;  // VANA
+    power->power_settings[1].power_seq_type = 3;  // VIO
+    power->power_settings[2].power_seq_type = 2;  // VDIG
+    power = power_set_wait(power, 1);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 8;  // RESET high
+    power->power_settings[0].config_val_low = 1;
+    power = power_set_wait(power, 12);
+
+    power->count = 1;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+    power->power_settings[0].power_seq_type = 0;  // MCLK
+    power->power_settings[0].config_val_low = sensor->mclk_frequency;
+    power = power_set_wait(power, 10);
+
+    // The vendor down sequence uses one common 1 ms delay after the group.
+    power->count = 5;
+    power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+    power->power_settings[0].power_seq_type = 8;  // RESET low
+    power->power_settings[0].config_val_low = 0;
+    power->power_settings[1].power_seq_type = 2;  // VDIG
+    power->power_settings[2].power_seq_type = 3;  // VIO
+    power->power_settings[3].power_seq_type = 1;  // VANA
+    power->power_settings[4].power_seq_type = 0;  // MCLK off
+    power->power_settings[4].config_val_low = 0;
+    power = power_set_wait(power, 1);
+  } else {
+  // power on
+  // Power seq types are the kernel's msm_camera_power_seq_type (cam_sensor_cmn_header.h,
+  // not exported through UAPI): 0=MCLK 1=VANA 2=VDIG 3=VIO 4=VAF 8=RESET 10=CUSTOM_GPIO1.
+  power->count = 5;
   power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
-  power->power_settings[0].power_seq_type = 3; // clock??
-  power->power_settings[1].power_seq_type = 1; // analog
-  power->power_settings[2].power_seq_type = 2; // digital
-  power->power_settings[3].power_seq_type = 8; // reset low
+  power->power_settings[0].power_seq_type = 3;  // VIO
+  power->power_settings[1].power_seq_type = 1;  // VANA (analog)
+  power->power_settings[2].power_seq_type = 2;  // VDIG (digital)
+  // ** xiaomi8 (dipper) / IMX363 **: this sensor does not come up without CUSTOM_GPIO1
+  // (device tree `gpio-custom1` -> GPIO 40 / CAM_CUSTOM0) asserted. Omitting it leaves the
+  // sensor unpowered, CCI reads return 0 words, and probe fails "chip id 0 does not match 363".
+  // comma3's OX03C10/OS04C10 have no such GPIO; the kernel's msm_cam_sensor_handle_reg_gpio()
+  // silently skips a seq type whose gpio_num_info->valid[] is 0, so this is a no-op there.
+  power->power_settings[3].power_seq_type = 10;  // CUSTOM_GPIO1
+  power->power_settings[3].config_val_low = 1;
+  power->power_settings[4].power_seq_type = 8;  // reset low
   power = power_set_wait(power, 1);
 
   // set clock
@@ -437,12 +495,22 @@ int SpectraCamera::sensors_init() {
   power->power_settings[0].config_val_low = 0;
   power = power_set_wait(power, 1);
 
-  // power off
-  power->count = 3;
+  // power off (mirror of the power-up group, including CUSTOM_GPIO1)
+  power->count = 4;
   power->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
-  power->power_settings[0].power_seq_type = 2;
-  power->power_settings[1].power_seq_type = 1;
-  power->power_settings[2].power_seq_type = 3;
+  power->power_settings[0].power_seq_type = 10;  // CUSTOM_GPIO1
+  power->power_settings[0].config_val_low = 0;
+  power->power_settings[1].power_seq_type = 2;   // VDIG
+  power->power_settings[2].power_seq_type = 1;   // VANA
+  power->power_settings[3].power_seq_type = 3;   // VIO
+
+  // The last group carries no trailing wait, so step over it by hand to get the exact
+  // byte count the kernel should parse.
+  power = (struct cam_cmd_power *)((char *)power + sizeof(struct cam_cmd_power) +
+                                   (power->count - 1) * sizeof(struct cam_power_settings));
+  }
+  buf_desc[1].size = buf_desc[1].length = (uint32_t)((char *)power - (char *)power_settings.get());
+  assert(buf_desc[1].length <= 256);
 
   int ret = do_cam_control(sensor_fd, CAM_SENSOR_PROBE_CMD, (void *)(uintptr_t)cam_packet_handle, 0);
   LOGD("probing the sensor: %d", ret);
@@ -609,7 +677,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     tmp.header = CAM_ICP_CMD_GENERIC_BLOB_CLK;
     tmp.header |= (sizeof(cam_icp_clk_bw_request)) << 8;
     tmp.clk.budget_ns = 0x1fca058;
-    tmp.clk.frame_cycles = 20000000; // force max BPS clock (600 MHz)
+    tmp.clk.frame_cycles = sensor->frame_width * sensor->frame_height; // matches striping lib pixelCount
     tmp.clk.rt_flag = 0x0;
     tmp.clk.uncompressed_bw = 0x38512180;
     tmp.clk.compressed_bw = 0x38512180;
@@ -787,7 +855,9 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       if (init) {
         buf_desc[0].length = build_initial_config((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches, buf.out_img_width, buf.out_img_height);
       } else {
-        buf_desc[0].length = build_update((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches);
+        const bool update_abf = ife_abf34_profile != ife_abf34_applied_profile;
+        buf_desc[0].length = build_update((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches,
+                                          ife_abf34_profile, update_abf);
       }
     }
 
@@ -920,10 +990,15 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   // sets up the kernel driver to do address translation for the IFE
   {
     // order here corresponds to the one in build_initial_config
-    assert(patches.size() == 6 || patches.size() == 0);
+    assert(patches.size() == 7 || patches.size() == 1 || patches.size() == 0);
 
     pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
-    if (patches.size() > 0) {
+    if (patches.size() == 1) {
+      const size_t n = sensor->abf34_noise_lut_profiles.size();
+      const size_t p = std::min<size_t>(std::max(ife_abf34_profile, 0), n - 1);
+      add_patch(pkt.get(), ife_cmd.handle, patches[0], ife_abf34_lut.handle,
+                p * 64 * sizeof(uint32_t));
+    } else if (patches.size() > 0) {
       // linearization LUT
       add_patch(pkt.get(), ife_cmd.handle, patches[0], ife_linearization_lut.handle, 0);
 
@@ -935,11 +1010,16 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       for (int i = 0; i < 3; i++) {
         add_patch(pkt.get(), ife_cmd.handle, patches[i+3], ife_gamma_lut.handle, ife_gamma_lut.size*i);
       }
+
+      add_patch(pkt.get(), ife_cmd.handle, patches[6], ife_abf34_lut.handle, 0);
     }
   }
 
   int ret = device_config(m->isp_fd, session_handle, isp_dev_handle, cam_packet_handle);
   assert(ret == 0);
+  if (!init) {
+    ife_abf34_applied_profile = ife_abf34_profile;
+  }
 }
 
 void SpectraCamera::enqueue_frame(uint64_t request_id) {
@@ -1045,9 +1125,10 @@ bool SpectraCamera::openSensor() {
     return (sensors_init() == 0);
   };
 
-  // Figure out which sensor we have
-  if (!init_sensor_lambda(new OS04C10) &&
-      !init_sensor_lambda(new OX03C10)) {
+  SensorInfo *candidate = cc.camera_num == 1
+                            ? static_cast<SensorInfo *>(new S5K3M3)
+                            : static_cast<SensorInfo *>(new IMX363);
+  if (!init_sensor_lambda(candidate)) {
     LOGE("** sensor %d FAILED bringup, disabling", cc.camera_num);
     enabled = false;
     return false;
@@ -1068,14 +1149,265 @@ bool SpectraCamera::openSensor() {
   LOGD("acquire sensor dev");
 
   LOG("-- Configuring sensor");
-  sensors_i2c(sensor->init_reg_array.data(), sensor->init_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+  if (cc.camera_num == 1 && sensor->init_reg_array.size() > 2) {
+    // The S5K3M3 vendor table requires 3 ms after software reset (0x6010).
+    sensors_i2c(sensor->init_reg_array.data(), 2, CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+    usleep(3000);
+    sensors_i2c(sensor->init_reg_array.data() + 2, sensor->init_reg_array.size() - 2,
+                CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+  } else {
+    sensors_i2c(sensor->init_reg_array.data(), sensor->init_reg_array.size(),
+                CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+  }
+
+  // Both rear modules use movable lenses. Keep a separate calibration value for
+  // each module because their actuators use different protocols and DAC ranges.
+  const bool tele = cc.camera_num == 1;
+  const char *focus_path = tele ? "/data/tele_focus_dac.txt" : "/data/focus_dac.txt";
+  const unsigned focus_max = tele ? 1023 : 4095;
+  // Tele DAC 220 is the measured far-focus peak for this Semco module.
+  const unsigned focus_default = tele ? 220 : 1550;
+  unsigned focus_dac = focus_default;
+  if (FILE *f = fopen(focus_path, "r")) {
+    const int parsed = fscanf(f, "%u", &focus_dac);
+    fclose(f);
+    if (parsed != 1 || focus_dac > focus_max) {
+      LOGE("invalid %s; expected one DAC value in [0, %u]", focus_path, focus_max);
+      focus_dac = focus_default;
+    }
+  }
+  configActuator(static_cast<uint16_t>(focus_dac));
+
+  if (tele) return true;
+
+  // The Mi 8 rear Semco IMX363 module has a kernel OIS driver.  The stock
+  // HAL configures it independently of the sensor request-manager link, so
+  // keep it as a separate device here too.  This is optical stabilization;
+  // it does not crop or warp the image as a future gyro EIS stage would.
+  configOIS();
   return true;
+}
+
+bool SpectraCamera::actuator_i2c(const struct i2c_random_wr_payload *dat, int len, int op_code, bool data_word) {
+  if (actuator_fd < 0 || actuator_dev_handle < 0) return false;
+
+  uint32_t cam_packet_handle = 0;
+  const int size = sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc);
+  auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
+  pkt->num_cmd_buf = 1;
+  pkt->kmd_cmd_buf_index = -1;
+  pkt->header.size = size;
+  pkt->header.op_code = op_code;
+  auto *buf_desc = reinterpret_cast<struct cam_cmd_buf_desc *>(&pkt->payload);
+
+  buf_desc[0].size = buf_desc[0].length = sizeof(struct i2c_rdwr_header) + len * sizeof(struct i2c_random_wr_payload);
+  buf_desc[0].type = CAM_CMD_BUF_I2C;
+  auto i2c_random_wr = m->mem_mgr.alloc<struct cam_cmd_i2c_random_wr>(buf_desc[0].size, reinterpret_cast<uint32_t *>(&buf_desc[0].mem_handle));
+  i2c_random_wr->header.count = len;
+  i2c_random_wr->header.op_code = 1;
+  i2c_random_wr->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+  i2c_random_wr->header.data_type = data_word ? CAMERA_SENSOR_I2C_TYPE_WORD : CAMERA_SENSOR_I2C_TYPE_BYTE;
+  i2c_random_wr->header.addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+  memcpy(i2c_random_wr->random_wr_payload, dat, len * sizeof(*dat));
+
+  const int ret = device_config(actuator_fd, session_handle, actuator_dev_handle, cam_packet_handle);
+  if (ret != 0) LOGE("camera %d actuator focus move failed: %d", cc.camera_num, ret);
+  return ret == 0;
+}
+
+void SpectraCamera::configActuator(uint16_t focus_dac) {
+  const bool tele = cc.camera_num == 1;
+  const char *actuator_name = tele ? "S5K3M3 AK7372" : "IMX363 AK7372";
+  actuator_fd = open_v4l_by_name_and_index("cam-actuator-driver", cc.camera_num);
+  if (actuator_fd < 0) {
+    LOGE("%s actuator subdevice %d unavailable; fixed focus disabled", actuator_name, cc.camera_num);
+    return;
+  }
+
+  auto dev_handle = device_acquire(actuator_fd, session_handle, nullptr);
+  if (!dev_handle) {
+    LOGE("failed to acquire %s actuator; fixed focus disabled", actuator_name);
+    close(actuator_fd.fd_);
+    actuator_fd.fd_ = -1;
+    return;
+  }
+  actuator_dev_handle = *dev_handle;
+
+  // This device has the Semco S5K3M3 variant. Its factory tuning uses an
+  // AK7372 at 0x18 on CCI1, with a 10-bit code shifted into bits [15:6].
+  const int num_cmd_buf = 2;
+  uint32_t cam_packet_handle = 0;
+  const int size = sizeof(struct cam_packet) + num_cmd_buf * sizeof(struct cam_cmd_buf_desc);
+  auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
+  pkt->num_cmd_buf = num_cmd_buf;
+  pkt->kmd_cmd_buf_index = -1;
+  pkt->header.size = size;
+  pkt->header.op_code = CAM_ACTUATOR_PACKET_OPCODE_INIT;
+  auto *buf_desc = reinterpret_cast<struct cam_cmd_buf_desc *>(&pkt->payload);
+
+  buf_desc[0].size = buf_desc[0].length = sizeof(struct cam_cmd_i2c_info);
+  buf_desc[0].type = CAM_CMD_BUF_LEGACY;
+  auto i2c_info = m->mem_mgr.alloc<struct cam_cmd_i2c_info>(buf_desc[0].size, reinterpret_cast<uint32_t *>(&buf_desc[0].mem_handle));
+  i2c_info->slave_addr = 0x18;
+  i2c_info->i2c_freq_mode = I2C_FAST_MODE;
+  i2c_info->cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
+
+  static const i2c_random_wr_payload kMainInit[] = {{0x02, 0x00}};
+  static const i2c_random_wr_payload kTeleInit[] = {
+    {0x00, 0x3c}, {0x01, 0x00}, {0x02, 0x00},
+  };
+  const i2c_random_wr_payload *init_regs = tele ? kTeleInit : kMainInit;
+  const int init_count = tele ? sizeof(kTeleInit) / sizeof(kTeleInit[0])
+                              : sizeof(kMainInit) / sizeof(kMainInit[0]);
+  buf_desc[1].size = buf_desc[1].length = sizeof(struct i2c_rdwr_header) + init_count * sizeof(struct i2c_random_wr_payload);
+  buf_desc[1].type = CAM_CMD_BUF_I2C;
+  auto init_wr = m->mem_mgr.alloc<struct cam_cmd_i2c_random_wr>(buf_desc[1].size,
+                 reinterpret_cast<uint32_t *>(&buf_desc[1].mem_handle));
+  init_wr->header.count = init_count;
+  init_wr->header.op_code = 1;
+  init_wr->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+  init_wr->header.data_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+  init_wr->header.addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+  memcpy(init_wr->random_wr_payload, init_regs, init_count * sizeof(*init_regs));
+
+  const int ret = device_config(actuator_fd, session_handle, actuator_dev_handle, cam_packet_handle);
+  if (ret != 0) {
+    LOGE("%s init failed: %d; fixed focus disabled", actuator_name, ret);
+    device_control(actuator_fd, CAM_RELEASE_DEV, session_handle, actuator_dev_handle);
+    actuator_dev_handle = -1;
+    close(actuator_fd.fd_);
+    actuator_fd.fd_ = -1;
+    return;
+  }
+
+  if (tele) {
+    const uint16_t focus_word = static_cast<uint16_t>(focus_dac << 6);
+    const struct i2c_random_wr_payload focus_reg = {0x00, focus_word};
+    actuator_i2c(&focus_reg, 1, CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS, true);
+    LOGD("S5K3M3 AK7372 tele fixed focus set to DAC %u", focus_dac);
+    return;
+  }
+
+  // The factory actuator tuning uses a 12-bit position. AK737x stores that
+  // position in bits [15:4] of the two-byte register at 0x00/0x01. The former
+  // 10-bit split put the code in bits [9:0], so all non-zero focus requests
+  // were scaled down by 16 and the focus scan barely moved the lens.
+  const uint16_t focus_word = static_cast<uint16_t>(focus_dac << 4);
+  const struct i2c_random_wr_payload focus_regs[] = {
+    {0x00, static_cast<uint16_t>(focus_word >> 8)},
+    {0x01, static_cast<uint16_t>(focus_word & 0xff)},
+  };
+  actuator_i2c(focus_regs, 2, CAM_ACTUATOR_PACKET_AUTO_MOVE_LENS, false);
+  LOGD("AK7372 fixed focus set to DAC %u", focus_dac);
+}
+
+void SpectraCamera::configOIS() {
+  ois_fd = open_v4l_by_name_and_index("cam-ois", 0);
+  if (ois_fd < 0) {
+    LOGE("IMX363 OIS subdevice unavailable; optical stabilization disabled");
+    return;
+  }
+
+  auto dev_handle = device_acquire(ois_fd, session_handle, nullptr);
+  if (!dev_handle) {
+    LOGE("failed to acquire IMX363 OIS; optical stabilization disabled");
+    close(ois_fd.fd_);
+    ois_fd.fd_ = -1;
+    return;
+  }
+  ois_dev_handle = *dev_handle;
+
+  // Captured from Xiaomi's dipper camera HAL while starting the same Semco
+  // IMX363 module.  The first command buffer is parsed as OIS slave/firmware
+  // metadata, the second as init data and the third as factory calibration.
+  // The downstream kernel then loads dipper_ois.prog and dipper_ois.coeff.
+  static const i2c_random_wr_payload kInit[] = {
+    {0x8262, 0xbf03}, {0x8263, 0x9f05}, {0x8264, 0x6040}, {0x8260, 0x1130},
+    {0x8265, 0x8000}, {0x8261, 0x0280}, {0x8261, 0x0380}, {0x8261, 0x0988},
+  };
+  static const i2c_random_wr_payload kCalibration[] = {
+    {0x847f, 0x0c0c}, {0x8436, 0xfd7f}, {0x8440, 0xff3f}, {0x8443, 0xf028},
+    {0x841b, 0x8000}, {0x84b6, 0xfd7f}, {0x84c0, 0xff3f}, {0x84c3, 0xf028},
+    {0x849b, 0x8000}, {0x8438, 0x3a14}, {0x84b8, 0x3a14}, {0x8447, 0x380d},
+    {0x84c7, 0x380d}, {0x8290, 0xfd7f}, {0x8296, 0x8001}, {0x8291, 0x0500},
+    {0x8292, 0x0200}, {0x8299, 0x8004}, {0x843a, 0x005a}, {0x84ba, 0x005a},
+    {0x843b, 0x00c6}, {0x84bb, 0x00c6}, {0x847f, 0x0d0d},
+  };
+
+  uint32_t cam_packet_handle = 0;
+  const int size = sizeof(cam_packet) + 3 * sizeof(cam_cmd_buf_desc);
+  auto pkt = m->mem_mgr.alloc<cam_packet>(size, &cam_packet_handle);
+  pkt->num_cmd_buf = 3;
+  pkt->kmd_cmd_buf_index = -1;
+  pkt->header.size = size;
+  pkt->header.op_code = CAM_OIS_PACKET_OPCODE_INIT;
+  auto *buf_desc = reinterpret_cast<cam_cmd_buf_desc *>(&pkt->payload);
+
+  buf_desc[0].size = buf_desc[0].length = sizeof(cam_cmd_ois_info_v4l2);
+  buf_desc[0].type = CAM_CMD_BUF_LEGACY;
+  auto info = m->mem_mgr.alloc<cam_cmd_ois_info_v4l2>(buf_desc[0].size, reinterpret_cast<uint32_t *>(&buf_desc[0].mem_handle));
+  info->slave_addr = 0x1c;  // 8-bit address; the CCI driver uses SID 0x0e.
+  info->i2c_freq_mode = I2C_FAST_MODE;
+  info->cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
+  info->ois_fw_flag = 1;
+  info->is_ois_calib = 1;
+  snprintf(info->ois_name, sizeof(info->ois_name), "%s", "dipper_ois");
+  info->opcode = {0x80, 0x88, 0x82, 0x84};
+
+  auto fill_i2c = [this, &buf_desc](int index, const i2c_random_wr_payload *regs, size_t count) {
+    buf_desc[index].size = buf_desc[index].length = sizeof(i2c_rdwr_header) + count * sizeof(i2c_random_wr_payload);
+    buf_desc[index].type = CAM_CMD_BUF_I2C;
+    auto cmd = m->mem_mgr.alloc<cam_cmd_i2c_random_wr>(buf_desc[index].size, reinterpret_cast<uint32_t *>(&buf_desc[index].mem_handle));
+    cmd->header.count = count;
+    cmd->header.op_code = 1;
+    cmd->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+    cmd->header.data_type = CAMERA_SENSOR_I2C_TYPE_WORD;
+    cmd->header.addr_type = CAMERA_SENSOR_I2C_TYPE_WORD;
+    memcpy(cmd->random_wr_payload, regs, count * sizeof(*regs));
+  };
+  fill_i2c(1, kInit, sizeof(kInit) / sizeof(kInit[0]));
+  fill_i2c(2, kCalibration, sizeof(kCalibration) / sizeof(kCalibration[0]));
+
+  int ret = device_config(ois_fd, session_handle, ois_dev_handle, cam_packet_handle);
+  if (ret == 0) ret = device_control(ois_fd, CAM_START_DEV, session_handle, ois_dev_handle);
+  if (ret == 0) {
+    LOGD("IMX363 OIS initialized with stock Semco calibration");
+    return;
+  }
+
+  LOGE("IMX363 OIS initialization failed: %d; continuing without OIS", ret);
+  device_control(ois_fd, CAM_STOP_DEV, session_handle, ois_dev_handle);
+  device_control(ois_fd, CAM_RELEASE_DEV, session_handle, ois_dev_handle);
+  ois_dev_handle = -1;
+  close(ois_fd.fd_);
+  ois_fd.fd_ = -1;
 }
 
 void SpectraCamera::configISP() {
   if (!enabled) return;
 
-  struct cam_isp_in_port_info in_port_info = {
+  // ** ABI mismatch guard (xiaomi8/dipper) **
+  // AGNOS's /usr/include/media/cam_isp.h has an extra `custom_csid` member that the Mi 8's
+  // running kernel (stock downstream SDM845 4.9.200) does not have. Using the header struct
+  // pushes `num_out_res` from offset 92 to 96, the kernel then reads our zeroed `reserved`,
+  // sees num_out_res=0 and fails the acquire with "No PIX or RDI resource".
+  // This mirrors the kernel's actual uapi layout (include/uapi/media/cam_isp.h, no custom_csid).
+  struct cam_isp_in_port_info_dipper {
+    uint32_t res_type, lane_type, lane_num, lane_cfg;
+    uint32_t vc, dt, format;
+    uint32_t test_pattern, usage_type;
+    uint32_t left_start, left_stop, left_width;
+    uint32_t right_start, right_stop, right_width;
+    uint32_t line_start, line_stop, height;
+    uint32_t pixel_clk, batch_size, dsp_mode, hbi_cnt;
+    uint32_t reserved;
+    uint32_t num_out_res;
+    struct cam_isp_out_port_info data[1];
+  };
+  static_assert(sizeof(struct cam_isp_in_port_info_dipper) == 128,
+                "cam_isp_in_port_info_dipper must match the running kernel's 128-byte layout");
+
+  struct cam_isp_in_port_info_dipper in_port_info = {
     // ISP input to the CSID
     .res_type = cc.phy,
     .lane_type = CAM_ISP_LANE_TYPE_DPHY,
@@ -1105,7 +1437,6 @@ void SpectraCamera::configISP() {
     .batch_size = 0x0,
     .dsp_mode = CAM_ISP_DSP_MODE_NONE,
     .hbi_cnt = 0x0,
-    .custom_csid = 0x0,
 
     // ISP outputs
     .num_out_res = 0x1,
@@ -1152,8 +1483,29 @@ void SpectraCamera::configISP() {
     memcpy(ife_linearization_lut.ptr, sensor->linearization_lut.data(), ife_linearization_lut.size);
     assert(sensor->vignetting_lut.size() == 221);
     ife_vignetting_lut.init(m, sensor->vignetting_lut.size()*sizeof(uint32_t), 0x20, false, m->device_iommu, m->cdm_iommu, 2);
-    for (int i = 0; i < 2; i++) {
-      memcpy(ife_vignetting_lut.ptr + ife_vignetting_lut.size*i, sensor->vignetting_lut.data(), ife_vignetting_lut.size);
+    // ife.h programs these as two *different* banks (DMI 14 = GRR, DMI 15 = GBB), so feeding
+    // the GRR table to both applies the R/Gr shading gains to B/Gb. Use the sensor's own GBB
+    // table when it has one; sensors that don't keep the previous duplicate-GRR behaviour.
+    memcpy(ife_vignetting_lut.ptr, sensor->vignetting_lut.data(), ife_vignetting_lut.size);
+    // DISABLE_GBB_LSC=1 forces the old duplicate-GRR behaviour, so the fix can be A/B tested
+    // on one binary without disturbing the camera between captures.
+    const bool has_gbb = sensor->vignetting_lut_gbb.size() == sensor->vignetting_lut.size() &&
+                         getenv("DISABLE_GBB_LSC") == nullptr;
+    memcpy(ife_vignetting_lut.ptr + ife_vignetting_lut.size,
+           has_gbb ? sensor->vignetting_lut_gbb.data() : sensor->vignetting_lut.data(),
+           ife_vignetting_lut.size);
+    assert(sensor->abf34_noise_lut.size() == 64);
+    const size_t abf_profiles = std::max<size_t>(1, sensor->abf34_noise_lut_profiles.size());
+    ife_abf34_lut.init(m, sensor->abf34_noise_lut.size()*sizeof(uint32_t), 0x20, false,
+                        m->device_iommu, m->cdm_iommu, abf_profiles);
+    if (sensor->abf34_noise_lut_profiles.empty()) {
+      memcpy(ife_abf34_lut.ptr, sensor->abf34_noise_lut.data(), ife_abf34_lut.size);
+    } else {
+      for (size_t i = 0; i < abf_profiles; ++i) {
+        assert(sensor->abf34_noise_lut_profiles[i].size() == 64);
+        memcpy(ife_abf34_lut.ptr + ife_abf34_lut.size*i,
+               sensor->abf34_noise_lut_profiles[i].data(), ife_abf34_lut.size);
+      }
     }
   }
 
@@ -1386,6 +1738,23 @@ void SpectraCamera::camera_close() {
   int ret = device_control(sensor_fd, CAM_RELEASE_DEV, session_handle, sensor_dev_handle);
   LOGD("release sensor: %d", ret);
 
+  if (actuator_dev_handle >= 0) {
+    ret = device_control(actuator_fd, CAM_RELEASE_DEV, session_handle, actuator_dev_handle);
+    LOGD("release AK7372 actuator: %d", ret);
+    actuator_dev_handle = -1;
+  }
+
+  // The downstream OIS driver rejects RELEASE while it is in START state.
+  // Keep this order even when the rest of the camera pipeline has already
+  // stopped so a later camerad restart can power the OIS cleanly.
+  if (ois_dev_handle >= 0) {
+    ret = device_control(ois_fd, CAM_STOP_DEV, session_handle, ois_dev_handle);
+    LOGD("stop IMX363 OIS: %d", ret);
+    ret = device_control(ois_fd, CAM_RELEASE_DEV, session_handle, ois_dev_handle);
+    LOGD("release IMX363 OIS: %d", ret);
+    ois_dev_handle = -1;
+  }
+
   // destroyed session
   struct cam_req_mgr_session_info session_info = {.session_hdl = session_handle};
   ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_DESTROY_SESSION, &session_info, sizeof(session_info));
@@ -1398,14 +1767,14 @@ bool SpectraCamera::handle_camera_event(const cam_req_mgr_message *event_data) {
   */
 
   uint64_t request_id = event_data->u.frame_msg.request_id;  // ID from the camera request manager
-  uint64_t ife_frame_id = event_data->u.frame_msg.frame_id;  // kernel counter incremented on each IFE SOF event
+  uint64_t frame_id_raw = event_data->u.frame_msg.frame_id;  // raw as opposed to our re-indexed frame ID
   uint64_t timestamp = event_data->u.frame_msg.timestamp;    // timestamped in the kernel's SOF IRQ callback
-  //LOGD("handle cam %d ts %lu req id %lu frame id %lu", cc.camera_num, timestamp, request_id, ife_frame_id);
+  //LOGD("handle cam %d ts %lu req id %lu frame id %lu", cc.camera_num, timestamp, request_id, frame_id_raw);
 
   // if there's a lag, some more frames could have already come in before
   // we cleared the queue, so we'll still get them with valid (> 0) request IDs.
   if (timestamp < last_requeue_ts) {
-    LOGD("skipping frame: ts before requeue / cam %d ts %lu req id %lu frame id %lu", cc.camera_num, timestamp, request_id, ife_frame_id);
+    LOGD("skipping frame: ts before requeue / cam %d ts %lu req id %lu frame id %lu", cc.camera_num, timestamp, request_id, frame_id_raw);
     return false;
   }
 
@@ -1413,39 +1782,39 @@ bool SpectraCamera::handle_camera_event(const cam_req_mgr_message *event_data) {
     return false;
   }
 
-  if (!validateEvent(request_id, ife_frame_id)) {
+  if (!validateEvent(request_id, frame_id_raw)) {
     return false;
   }
 
   // Update tracking variables
-  if (request_id == last_valid_request_id + 1) {
+  if (request_id == request_id_last + 1) {
     skip_expected = false;
   }
-  last_valid_ife_frame_id = ife_frame_id;
-  last_valid_request_id = request_id;
+  frame_id_raw_last = frame_id_raw;
+  request_id_last = request_id;
 
   // Wait until frame's fully read out and processed
   if (!waitForFrameReady(request_id)) {
     // Reset queue on sync failure to prevent frame tearing
-    LOGE("camera %d sync failure %ld %ld ", cc.camera_num, request_id, ife_frame_id);
+    LOGE("camera %d sync failure %ld %ld ", cc.camera_num, request_id, frame_id_raw);
     clearAndRequeue(request_id + 1);
     return false;
   }
 
   int buf_idx = request_id % ife_buf_depth;
-  bool ret = processFrame(buf_idx, request_id, ife_frame_id, timestamp);
+  bool ret = processFrame(buf_idx, request_id, frame_id_raw, timestamp);
   destroySyncObjectAt(buf_idx);
   enqueue_frame(request_id + ife_buf_depth);  // request next frame for this slot
   return ret;
 }
 
-bool SpectraCamera::validateEvent(uint64_t request_id, uint64_t ife_frame_id) {
+bool SpectraCamera::validateEvent(uint64_t request_id, uint64_t frame_id_raw) {
   // check if the request ID is even valid. this happens after queued
   // requests are cleared. unclear if it happens any other time.
   if (request_id == 0) {
     if (invalid_request_count++ > ife_buf_depth+2) {
       LOGE("camera %d reset after half second of invalid requests", cc.camera_num);
-      clearAndRequeue(last_valid_request_id + 1);
+      clearAndRequeue(request_id_last + 1);
       invalid_request_count = 0;
     }
     return false;
@@ -1454,14 +1823,14 @@ bool SpectraCamera::validateEvent(uint64_t request_id, uint64_t ife_frame_id) {
 
   // check for skips in frame_id or request_id
   if (!skip_expected) {
-    if (ife_frame_id != last_valid_ife_frame_id + 1) {
-      LOGE("camera %d frame ID skipped, %lu -> %lu", cc.camera_num, last_valid_ife_frame_id, ife_frame_id);
+    if (frame_id_raw != frame_id_raw_last + 1) {
+      LOGE("camera %d frame ID skipped, %lu -> %lu", cc.camera_num, frame_id_raw_last, frame_id_raw);
       clearAndRequeue(request_id + 1);
       return false;
     }
 
-    if (request_id != last_valid_request_id + 1) {
-      LOGE("camera %d requests skipped %ld -> %ld", cc.camera_num, last_valid_request_id, request_id);
+    if (request_id != request_id_last + 1) {
+      LOGE("camera %d requests skipped %ld -> %ld", cc.camera_num, request_id_last, request_id);
       clearAndRequeue(request_id + 1);
       return false;
     }
@@ -1512,9 +1881,101 @@ bool SpectraCamera::waitForFrameReady(uint64_t request_id) {
   return success;
 }
 
-bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t ife_frame_id, uint64_t timestamp) {
-  if (!syncFirstFrame(cc.camera_num, request_id, ife_frame_id, timestamp, cc.staggered_sof)) {
+bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t frame_id_raw, uint64_t timestamp) {
+  // Unlike comma 3/3X, the two Mi 8 rear sensors have no shared frame-sync
+  // trigger. Their independent PLLs differ by a few microseconds per frame,
+  // which grows beyond modeld's synchronization window. Once per second,
+  // trim the tele sensor's frame length around its nominal value. This runs on
+  // a different phase than AE, so it does not make the downstream kernel issue
+  // simultaneous diagnostic I2C readbacks for both operations.
+  static std::array<std::atomic<uint64_t>, 2> mi8_sof = {};
+  static std::array<std::atomic<uint64_t>, 2> mi8_raw_id = {};
+  static int mi8_tele_fll = 3428;
+  static std::array<int64_t, 9> mi8_phase_error_window = {};
+  static size_t mi8_phase_error_count = 0;
+  static size_t mi8_phase_error_index = 0;
+  const bool mi8_dual = getenv("ENABLE_TELE") != nullptr ||
+                        access("/data/enable_mi8_tele_camera", F_OK) == 0;
+  if (mi8_dual && cc.camera_num <= 1) {
+    mi8_sof[cc.camera_num].store(timestamp, std::memory_order_relaxed);
+    mi8_raw_id[cc.camera_num].store(frame_id_raw, std::memory_order_relaxed);
+    const uint64_t main_sof = mi8_sof[0].load(std::memory_order_relaxed);
+    if (cc.camera_num == 1 && main_sof != 0) {
+      constexpr int64_t frame_period_ns = 50000000;
+      constexpr int64_t half_period_ns = frame_period_ns / 2;
+      constexpr int64_t target_phase_ns = 100000;  // tele follows main by 0.1 ms
+      constexpr int64_t tele_line_ns = 14580;
+      constexpr int correction_frames = 17;  // allow for sensor register latency
+      constexpr int nominal_fll = 3428;
+
+      int64_t phase_ns = static_cast<int64_t>(timestamp) - static_cast<int64_t>(main_sof);
+      while (phase_ns > half_period_ns) phase_ns -= frame_period_ns;
+      while (phase_ns < -half_period_ns) phase_ns += frame_period_ns;
+
+      const int64_t phase_error_ns = phase_ns - target_phase_ns;
+      mi8_phase_error_window[mi8_phase_error_index] = phase_error_ns;
+      mi8_phase_error_index = (mi8_phase_error_index + 1) % mi8_phase_error_window.size();
+      mi8_phase_error_count = std::min(mi8_phase_error_count + 1, mi8_phase_error_window.size());
+
+      if (frame_id_raw % 20 == 2) {
+        // The Mi 8 kernel timestamps SOF in its IRQ callback. Under sustained
+        // GPU load that callback can be delayed by several milliseconds even
+        // though the exposure itself stayed in phase. Filter the last nine
+        // circular phase samples before changing sensor timing so a scheduling
+        // spike cannot make the controller pull a good sensor out of lock.
+        auto sorted_errors = mi8_phase_error_window;
+        std::sort(sorted_errors.begin(), sorted_errors.begin() + mi8_phase_error_count);
+        const int64_t filtered_phase_error_ns = sorted_errors[mi8_phase_error_count / 2];
+        constexpr int64_t large_error_ns = 1500000;
+        const bool startup_lock = !first_frame_synced;
+        const bool large_error = std::abs(filtered_phase_error_ns) > large_error_ns;
+        const double correction = static_cast<double>(-filtered_phase_error_ns) /
+                                  static_cast<double>(tele_line_ns * correction_frames);
+        const int correction_limit = (startup_lock || large_error) ? 20 : 4;
+        const int correction_lines = std::clamp(static_cast<int>(std::llround(correction)),
+                                                -correction_limit, correction_limit);
+        const int requested_fll = std::clamp(nominal_fll + correction_lines, 3408, 3448);
+        if (requested_fll != mi8_tele_fll) {
+          const i2c_random_wr_payload fll_reg = {0x0340, static_cast<uint16_t>(requested_fll)};
+          sensors_i2c(&fll_reg, 1, CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+          mi8_tele_fll = requested_fll;
+          if (startup_lock || large_error || std::abs(correction_lines) > 2) {
+            LOGW("Mi 8 tele raw phase %.3f ms, median error %.3f ms, setting FLL %d",
+                 phase_ns / 1e6, filtered_phase_error_ns / 1e6, requested_fll);
+          }
+        }
+      }
+    }
+  }
+
+  if (!syncFirstFrame(cc.camera_num, request_id, frame_id_raw, timestamp, false)) {  // 2026-08-30: single camera, no staggered SOF
     return false;
+  }
+
+  if (mi8_dual && cc.camera_num <= 1) {
+    // A kernel queue recovery can jump one camera's raw counter without
+    // restarting camerad. Keep camera 0 as the sequence authority and realign
+    // the tele offset only when both latest SOFs are clearly the same physical
+    // exposure. Run this check after either camera event: depending on their
+    // sub-millisecond phase, tele can arrive just before main, in which case a
+    // tele-only check compares against main's previous (50 ms old) exposure
+    // and can never recover a one-frame startup offset. This preserves shared
+    // IDs across requeues without rounding SOF timestamps to a fixed clock grid.
+    const uint64_t main_sof = mi8_sof[0].load(std::memory_order_relaxed);
+    const uint64_t tele_sof = mi8_sof[1].load(std::memory_order_relaxed);
+    const uint64_t sof_delta = (tele_sof > main_sof) ? tele_sof - main_sof : main_sof - tele_sof;
+    constexpr uint64_t same_exposure_tolerance_ns = 10000000;
+    if (main_sof != 0 && tele_sof != 0 && sof_delta <= same_exposure_tolerance_ns) {
+      const uint64_t main_raw_id = mi8_raw_id[0].load(std::memory_order_relaxed);
+      const uint64_t tele_raw_id = mi8_raw_id[1].load(std::memory_order_relaxed);
+      const uint64_t main_frame_id = main_raw_id - camera_sync_data[0].frame_id_offset;
+      const uint64_t tele_frame_id = tele_raw_id - camera_sync_data[1].frame_id_offset;
+      if (tele_frame_id != main_frame_id && tele_raw_id >= main_frame_id) {
+        LOGW("Mi 8 realigning tele frame ID %lu -> %lu (SOF delta %.3f ms)",
+             tele_frame_id, main_frame_id, sof_delta / 1e6);
+        camera_sync_data[1].frame_id_offset = tele_raw_id - main_frame_id;
+      }
+    }
   }
 
   // in IFE_PROCESSED mode, we can't know the true EOF, so recover it with sensor readout time
@@ -1522,8 +1983,15 @@ bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t ife_
 
   // Update buffer and frame data
   buf.cur_buf_idx = buf_idx;
+  // Keep the public sequence tied to each sensor's monotonic hardware counter.
+  // syncFirstFrame() records an offset only after both SOFs are aligned, so the
+  // two counters describe the same physical exposure. Deriving IDs by rounding
+  // timestamps to an ideal 50 ms grid is unsafe: the real oscillators drift
+  // relative to that grid and two genuinely synchronized SOFs can temporarily
+  // land on opposite sides of a rounding boundary.
+  uint32_t frame_id = (uint32_t)(frame_id_raw - camera_sync_data[cc.camera_num].frame_id_offset);
   buf.cur_frame_data = {
-    .frame_id = (uint32_t)(ife_frame_id - camera_sync_data[cc.camera_num].frame_id_offset),
+    .frame_id = frame_id,
     .request_id = (uint32_t)request_id,
     .timestamp_sof = timestamp,
     .timestamp_eof = timestamp_eof,
@@ -1532,11 +2000,11 @@ bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t ife_
   return true;
 }
 
-bool SpectraCamera::syncFirstFrame(int camera_id, uint64_t request_id, uint64_t ife_frame_id, uint64_t timestamp, bool staggered) {
+bool SpectraCamera::syncFirstFrame(int camera_id, uint64_t request_id, uint64_t raw_id, uint64_t timestamp, bool staggered) {
   if (first_frame_synced) return true;
 
   // Store the frame data for this camera
-  camera_sync_data[camera_id] = SyncData{timestamp, ife_frame_id + 1, staggered};
+  camera_sync_data[camera_id] = SyncData{timestamp, raw_id + 1, staggered};
 
   // Ensure all cameras are up
   int enabled_camera_count = std::count_if(std::begin(ALL_CAMERA_CONFIGS), std::end(ALL_CAMERA_CONFIGS),
@@ -1563,13 +2031,17 @@ bool SpectraCamera::syncFirstFrame(int camera_id, uint64_t request_id, uint64_t 
 
   if (all_cams_up && all_cams_synced) {
     first_frame_synced = true;
+    sync_epoch_timestamp = timestamp;
+    for (const auto &[cam, sync_data] : camera_sync_data) {
+      sync_epoch_timestamp = std::min(sync_epoch_timestamp, sync_data.timestamp);
+    }
     for (const auto&[cam, sync_data] : camera_sync_data) {
       LOGW("camera %d synced on frame_id_offset %ld timestamp %lu", cam, sync_data.frame_id_offset, sync_data.timestamp);
     }
   }
 
   // Timeout in case the timestamps never line up
-  if (ife_frame_id > 40) {
+  if (raw_id > 80) {
     LOGE("camera first frame sync timed out");
     first_frame_synced = true;
   }

@@ -11,6 +11,7 @@ import SCons.Errors
 from SCons.Defaults import _stripixes
 
 COMMA_HARDWARE = os.path.isfile('/AGNOS')
+MI8_HARDWARE = os.path.isfile('/TICI') or os.path.isfile('/persist/comma/use-broadcom-gps')
 
 SCons.Warnings.warningAsException(True)
 
@@ -46,7 +47,7 @@ if external_pythonpath := os.environ.get("PYTHONPATH"):
 arch = subprocess.check_output(["uname", "-m"], encoding='utf8').rstrip()
 if platform.system() == "Darwin":
   arch = "Darwin"
-elif arch == "aarch64" and COMMA_HARDWARE:
+elif arch == "aarch64" and (COMMA_HARDWARE or MI8_HARDWARE):
   arch = "comma_arm64"
 assert arch in [
   "comma_arm64",  # linux comma hardware (AGNOS) arm64
@@ -185,6 +186,13 @@ if arch == "comma_arm64":
   arch_flags = ["-D__COMMA_HARDWARE__", "-mcpu=cortex-a57"]
   env.Append(CCFLAGS=arch_flags)
   env.Append(CXXFLAGS=arch_flags)
+  if MI8_HARDWARE:
+    # The Clang 18 build shipped on the Mi 8 image exposes the AArch64 NEON
+    # feature macros but is missing the corresponding builtin vector types.
+    # Current Eigen then includes arm_neon.h and fails before compiling any
+    # locationd code. Keep Eigen scalar on this legacy toolchain; other ARM
+    # code still retains the Cortex-A57 optimization flags above.
+    env.Append(CXXFLAGS=["-DEIGEN_DONT_VECTORIZE"])
 elif arch == "Darwin":
   env.Append(LIBPATH=[
     "/System/Library/Frameworks/OpenGL.framework/Libraries",
@@ -195,6 +203,8 @@ elif arch == "Darwin":
 _extra_cc = shlex.split(GetOption('ccflags') or '')
 if _extra_cc:
   env.Append(CCFLAGS=_extra_cc)
+if mi8_kernel_headers := os.getenv("MI8_KERNEL_HEADERS"):
+  env.Append(CPPPATH=[Dir(mi8_kernel_headers).abspath])
 
 # no --as-needed on mac linker
 if arch != "Darwin":
@@ -281,7 +291,7 @@ SConscript([
   'openpilot/system/loggerd/SConscript',
 ])
 
-if arch == "comma_arm64":
+if arch == "comma_arm64" or os.getenv("BUILD_MI8_CAMERA_TEST"):
   SConscript(['openpilot/system/camerad/SConscript'])
 
 # Build selfdrive

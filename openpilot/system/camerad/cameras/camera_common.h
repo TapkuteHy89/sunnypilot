@@ -2,10 +2,9 @@
 
 #include <memory>
 
-#include "openpilot/cereal/messaging/messaging.h"
+#include "cereal/messaging/messaging.h"
 #include "msgq/visionipc/visionipc_server.h"
 #include "common/util.h"
-
 
 const int VIPC_BUFFER_COUNT = 18;
 
@@ -36,8 +35,20 @@ public:
 
   CameraBuf() = default;
   ~CameraBuf();
-  void init(SpectraCamera *cam, VisionIpcServer * v, int frame_cnt, VisionStreamType type);
+  void init(void *device_id, void *context, SpectraCamera *cam, VisionIpcServer * v, int frame_cnt, VisionStreamType type);
   void sendFrameToVipc();
+
+  // Raw frame dimensions (may differ from output with out_scale > 1)
+  int raw_width = 0;
+  int raw_height = 0;
+  int raw_stride = 0;
+
+  // Auto White Balance state (Grey World AWB)
+  // r_total = combined DPAF correction + WB for R channel (Gb_avg / R_avg)
+  // b_gain = WB for B channel (Gb_avg / B_avg)
+  float awb_r_total = 1.16f;  // Initial estimate
+  float awb_b_gain = 1.00f;   // Initial estimate
+  int awb_frame_count = 0;
 };
 
 void camerad_thread();

@@ -32,11 +32,19 @@ def affine_irq(val, action):
     sudo_write(str(val), f"/proc/irq/{i}/smp_affinity_list")
 
 @lru_cache
+def is_mi8_hardware():
+  with open("/sys/firmware/devicetree/base/model") as f:
+    model = f.read().strip('\x00')
+  return not model.lower().startswith('comma ')
+
+@lru_cache
 def get_device_type():
   # lru_cache and cache can cause memory leaks when used in classes
   with open("/sys/firmware/devicetree/base/model") as f:
     model = f.read().strip('\x00')
-  return model.split('comma ')[-1]
+  if is_mi8_hardware():
+    return 'tici'
+  return model.split('comma ', 1)[-1]
 
 def wpa_supplicant_cmd(cmd: str, timeout: float = 0.2) -> dict[str, str]:
   with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
@@ -71,7 +79,7 @@ class HardwareComma(HardwareBase):
 
   @cached_property
   def amplifier(self):
-    if self.get_device_type() == "mici":
+    if self.get_device_type() == "mici" or is_mi8_hardware():
       return None
     return Amplifier()
 
@@ -350,9 +358,10 @@ class HardwareComma(HardwareBase):
     # Allow hardwared to write engagement status to kmsg
     subprocess.run("sudo chmod a+w /dev/kmsg", shell=True)
 
-    # Ensure fan gpio is enabled so fan runs until shutdown, also turned on at boot by the ABL
-    gpio_init(GPIO.SOM_ST_IO, True)
-    gpio_set(GPIO.SOM_ST_IO, True)
+    # GPIO49 is a comma-device fan control and is not exported on the Mi 8.
+    if not is_mi8_hardware():
+      gpio_init(GPIO.SOM_ST_IO, True)
+      gpio_set(GPIO.SOM_ST_IO, True)
 
     # *** IRQ config ***
 
@@ -365,7 +374,8 @@ class HardwareComma(HardwareBase):
 
     # *** GPU config ***
     # https://github.com/commaai/agnos-kernel-sdm845/blob/master/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi#L216
-    affine_irq(5, "fts_ts")    # touch
+    if not is_mi8_hardware():
+      affine_irq(5, "fts_ts")  # touch
     affine_irq(5, "msm_drm")   # display
     sudo_write("1", "/sys/class/kgsl/kgsl-3d0/min_pwrlevel")
     sudo_write("1", "/sys/class/kgsl/kgsl-3d0/max_pwrlevel")
@@ -399,6 +409,8 @@ class HardwareComma(HardwareBase):
     return ms.get('tx_bytes', -1), ms.get('rx_bytes', -1)
 
   def reset_internal_panda(self):
+    if is_mi8_hardware():
+      return
     gpio_init(GPIO.STM_RST_N, True)
     gpio_init(GPIO.STM_BOOT0, True)
 
@@ -408,6 +420,8 @@ class HardwareComma(HardwareBase):
     gpio_set(GPIO.STM_RST_N, False)
 
   def recover_internal_panda(self):
+    if is_mi8_hardware():
+      return
     gpio_init(GPIO.STM_RST_N, True)
     gpio_init(GPIO.STM_BOOT0, True)
 

@@ -14,7 +14,7 @@ from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
 
 RELAXED_MIN_BUCKET_POINTS = np.array([1, 200, 300, 500, 500, 300, 200, 1])
 
-ALLOWED_CARS = ['toyota', 'hyundai', 'rivian', 'honda']
+ALLOWED_CARS = ['toyota', 'hyundai', 'rivian', 'honda', 'baic']
 
 
 class TorqueEstimatorExt:
@@ -37,9 +37,16 @@ class TorqueEstimatorExt:
   def initialize_custom_params(self, decimated=False):
     self.update_use_params()
 
+    relaxed_live_torque = self._params.get_bool("LiveTorqueParamsRelaxedToggle")
+    if relaxed_live_torque and (self.enforce_torque_control_toggle or self.CP.brand == 'baic'):
+      # BAIC's OEM steering envelope supplies fewer samples in the second
+      # negative-torque bucket. Relax only the distribution requirement; keep
+      # the normal factor/friction sanity bounds unless torque control itself
+      # is being force-enabled.
+      self.min_bucket_points = (RELAXED_MIN_BUCKET_POINTS / (10 if decimated else 1)).tolist()
+
     if self.enforce_torque_control_toggle:
-      if self._params.get_bool("LiveTorqueParamsRelaxedToggle"):
-        self.min_bucket_points = RELAXED_MIN_BUCKET_POINTS / (10 if decimated else 1)
+      if relaxed_live_torque:
         self.factor_sanity = 0.5 if decimated else 1.0
         self.friction_sanity = 0.8 if decimated else 1.0
 

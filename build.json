@@ -1,0 +1,12 @@
+{
+  "channel": "dev",
+  "openpilot": {
+    "version": "2026.003.000",
+    "release_notes": "Mi8 BAIC X7 migration based on sunnypilot master",
+    "git_commit": "922513f3128b00611d695ce465989a9bc8af9d59",
+    "git_origin": "https://github.com/sunnypilot/sunnypilot.git",
+    "git_commit_date": "2026-10-18T22:41:23-07:00",
+    "build_style": "debug",
+    "is_dirty": true
+  }
+}

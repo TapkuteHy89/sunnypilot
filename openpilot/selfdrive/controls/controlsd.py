@@ -30,6 +30,18 @@ LaneChangeDirection = log.LaneChangeDirection
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
 
+# The BAIC X7 camera/model combination can predict a path that remains offset
+# from two clearly detected lane boundaries. Keep the correction deliberately
+# small: it only recenters the model path and never replaces its curvature.
+X7_LANE_CENTER_MIN_SPEED = 26.0 * CV.KPH_TO_MS
+X7_LANE_CENTER_MIN_PROB = 0.60
+X7_LANE_CENTER_MIN_WIDTH = 2.4
+X7_LANE_CENTER_MAX_WIDTH = 4.8
+X7_LANE_CENTER_DEADBAND = 0.08
+X7_LANE_CENTER_GAIN = 0.32
+X7_LANE_CENTER_MAX_LAT_ACCEL = 0.12
+X7_LANE_CENTER_FILTER_ALPHA = 0.10
+
 
 class Controls(ControlsExt):
   def __init__(self) -> None:
@@ -52,6 +64,9 @@ class Controls(ControlsExt):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.x7_lane_center_guard = self.CP.carFingerprint == "BEIJING_X7_2022"
+    self.x7_lane_center_guard_lat_accel = 0.0
+    self.x7_lane_center_guard_apply = False
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -77,6 +92,63 @@ class Controls(ControlsExt):
     if self.sm.updated["deviceMotion"]:
       device_motion = Pose.from_device_motion(self.sm['deviceMotion'])
       self.calibrated_pose = self.pose_calibrator.build_calibrated_pose(device_motion)
+
+  @staticmethod
+  def _model_y_at_distance(line, distance: float) -> float | None:
+    count = min(len(line.x), len(line.y))
+    if count == 0:
+      return None
+    index = min(range(count), key=lambda i: abs(float(line.x[i]) - distance))
+    return float(line.y[index])
+
+  def _update_x7_lane_center_guard(self, model_v2, CS, lat_active: bool) -> None:
+    target_lat_accel = 0.0
+    self.x7_lane_center_guard_apply = False
+    lane_change_off = model_v2.meta.laneChangeState == LaneChangeState.off
+    guard_allowed = (
+      self.x7_lane_center_guard and lat_active and CS.vEgo >= X7_LANE_CENTER_MIN_SPEED and
+      not CS.steeringPressed and not CS.leftBlinker and not CS.rightBlinker and lane_change_off
+    )
+
+    if guard_allowed and len(model_v2.laneLines) >= 3 and len(model_v2.laneLineProbs) >= 3:
+      left_prob = float(model_v2.laneLineProbs[1])
+      right_prob = float(model_v2.laneLineProbs[2])
+      min_prob = min(left_prob, right_prob)
+      if min_prob >= X7_LANE_CENTER_MIN_PROB:
+        offsets = []
+        for distance in (0.0, 10.0, 20.0):
+          left_y = self._model_y_at_distance(model_v2.laneLines[1], distance)
+          right_y = self._model_y_at_distance(model_v2.laneLines[2], distance)
+          path_y = self._model_y_at_distance(model_v2.position, distance)
+          if left_y is None or right_y is None or path_y is None:
+            offsets = []
+            break
+          lane_width = right_y - left_y
+          if not X7_LANE_CENTER_MIN_WIDTH <= lane_width <= X7_LANE_CENTER_MAX_WIDTH:
+            offsets = []
+            break
+          offsets.append(path_y - (left_y + right_y) * 0.5)
+
+        if len(offsets) == 3:
+          # Model y and desired lateral-acceleration signs are positive right.
+          # A negative path-minus-center bias therefore needs a positive (right)
+          # correction, and vice versa.
+          future_bias = 0.35 * offsets[1] + 0.65 * offsets[2]
+          if offsets[0] * future_bias < 0.0 and abs(offsets[0]) > X7_LANE_CENTER_DEADBAND:
+            bias = 0.5 * offsets[0] + 0.5 * future_bias
+          else:
+            bias = future_bias
+          confidence = 0.5 + 0.5 * min(1.0, (min_prob - X7_LANE_CENTER_MIN_PROB) / 0.35)
+          correction_magnitude = min(
+            max(0.0, abs(bias) - X7_LANE_CENTER_DEADBAND) * X7_LANE_CENTER_GAIN * confidence,
+            X7_LANE_CENTER_MAX_LAT_ACCEL,
+          )
+          target_lat_accel = -math.copysign(correction_magnitude, bias) if correction_magnitude > 0.0 else 0.0
+          self.x7_lane_center_guard_apply = True
+
+    self.x7_lane_center_guard_lat_accel += X7_LANE_CENTER_FILTER_ALPHA * (
+      target_lat_accel - self.x7_lane_center_guard_lat_accel
+    )
 
   def state_control(self):
     CS = self.sm['carState']
@@ -143,6 +215,12 @@ class Controls(ControlsExt):
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
+    if self.sm.updated['modelV2']:
+      self._update_x7_lane_center_guard(model_v2, CS, CC.latActive)
+    if CC.latActive and self.x7_lane_center_guard and self.x7_lane_center_guard_apply:
+      new_desired_curvature += self.x7_lane_center_guard_lat_accel / max(
+        CS.vEgo ** 2, X7_LANE_CENTER_MIN_SPEED ** 2,
+      )
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 

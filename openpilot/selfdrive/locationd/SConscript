@@ -1,18 +1,29 @@
+import os
+
 Import('env', 'rednose')
+
+filter_env = env
+if os.path.isfile('/TICI'):
+  # The Mi 8 image's Clang 18 arm_neon.h is incompatible with its builtin
+  # vector types. GCC 13 on the same image has a working AArch64 NEON backend,
+  # so retain vectorized Eigen for the generated EKFs without affecting the
+  # compiler used by the rest of openpilot.
+  filter_env = env.Clone(CXX='g++')
+  filter_env['CXXFLAGS'] = [flag for flag in filter_env['CXXFLAGS'] if flag != '-DEIGEN_DONT_VECTORIZE']
 
 # build ekf models
 rednose_gen_dir = 'models/generated'
 rednose_gen_deps = [
   "models/constants.py",
 ]
-pose_ekf = env.RednoseCompileFilter(
+pose_ekf = filter_env.RednoseCompileFilter(
   target='pose',
   filter_gen_script='models/pose_kf.py',
   output_dir=rednose_gen_dir,
   extra_gen_artifacts=[],
   gen_script_deps=rednose_gen_deps,
 )
-car_ekf = env.RednoseCompileFilter(
+car_ekf = filter_env.RednoseCompileFilter(
   target='car',
   filter_gen_script='models/car_kf.py',
   output_dir=rednose_gen_dir,

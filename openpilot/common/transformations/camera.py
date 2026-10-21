@@ -1,4 +1,5 @@
 import itertools
+import os
 import numpy as np
 from dataclasses import dataclass
 
@@ -49,6 +50,20 @@ class DeviceCameraConfig:
 _ar_ox_fisheye = CameraConfig(1928, 1208, 567.0)  # focal length probably wrong? magnification is not consistent across frame
 _os_fisheye = CameraConfig(2688 // 2, 1520 // 2, 567.0 / 4 * 3)
 _ar_ox_config = DeviceCameraConfig(CameraConfig(1928, 1208, 2648.0), _ar_ox_fisheye, _ar_ox_fisheye)
+
+def _mi8_wide_focal() -> float:
+  try:
+    with open("/data/road_cam_focal.txt") as f:
+      return float(f.read().strip())
+  except (OSError, ValueError):
+    # IMX363 4.44 mm / 1.4 um with 2x2 binning.
+    return 1585.7
+
+_mi8_config = DeviceCameraConfig(
+  CameraConfig(2104, 1560, 2600.0),       # S5K3M3 tele / narrow road
+  _NoneCameraConfig(),
+  CameraConfig(1920, 1080, _mi8_wide_focal()),  # IMX363 main / wide road
+)
 _os_config = DeviceCameraConfig(CameraConfig(2688 // 2, 1520 // 2, 1522.0 * 3 / 4), _os_fisheye, _os_fisheye)
 _neo_config = DeviceCameraConfig(CameraConfig(1164, 874, 910.0), CameraConfig(816, 612, 650.0), _NoneCameraConfig())
 
@@ -69,6 +84,12 @@ DEVICE_CAMERAS: dict[tuple[str, str], DeviceCameraConfig] = {
 }
 prods = itertools.product(('tici', 'tizi', 'mici'), (('ar0231', _ar_ox_config), ('ox03c10', _ar_ox_config), ('os04c10', _os_config)))
 DEVICE_CAMERAS.update({(d, c[0]): c[1] for d, c in prods})
+
+# The Android Mi 8 port intentionally keeps the generic PC hardware backend,
+# but uses the /TICI or Broadcom-GPS marker for its calibrated optics.
+if os.path.isfile('/TICI') or os.path.isfile('/persist/comma/use-broadcom-gps'):
+  DEVICE_CAMERAS[("pc", "unknown")] = _mi8_config
+  DEVICE_CAMERAS[("tici", "unknown")] = _mi8_config
 
 # device/mesh : x->forward, y-> right, z->down
 # view : x->right, y->down, z->forward
